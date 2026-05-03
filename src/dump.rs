@@ -945,13 +945,37 @@ mod imp {
         let mut scan = code_item_ptr & !(CODE_ITEM_BACKSCAN_STEP - 1);
         let scan_floor = code_item_ptr.saturating_sub(CODE_ITEM_BACKSCAN_LIMIT);
         while scan >= scan_floor {
-            if let Ok(header) = read_remote_mem(pid, scan, DEX_HEADER_SIZE) {
-                if let Some(size) = validate_dex_header_contains(&header, scan, code_item_ptr) {
-                    let bytes = read_remote_mem(pid, scan, size)
-                        .with_context(|| format!("read dex from 0x{scan:x}, size 0x{size:x}"))?;
-                    if DexParser::new(&bytes).is_ok() {
-                        return Ok(Some((scan, size, bytes)));
+            let Ok(page) = read_remote_mem(pid, scan, CODE_ITEM_BACKSCAN_STEP as u32) else {
+                if scan < CODE_ITEM_BACKSCAN_STEP {
+                    break;
+                }
+                scan -= CODE_ITEM_BACKSCAN_STEP;
+                continue;
+            };
+            let mut off = 0usize;
+            while let Some(idx) = find_subslice(&page[off..], b"dex\n") {
+                let begin = scan + (off + idx) as u64;
+                if begin > code_item_ptr || begin + DEX_HEADER_SIZE as u64 <= code_item_ptr {
+                    off += idx + 4;
+                    if off >= page.len() {
+                        break;
                     }
+                    continue;
+                }
+                if let Ok(header) = read_remote_mem(pid, begin, DEX_HEADER_SIZE) {
+                    if let Some(size) = validate_dex_header_contains(&header, begin, code_item_ptr)
+                    {
+                        let bytes = read_remote_mem(pid, begin, size).with_context(|| {
+                            format!("read dex from 0x{begin:x}, size 0x{size:x}")
+                        })?;
+                        if DexParser::new(&bytes).is_ok() {
+                            return Ok(Some((begin, size, bytes)));
+                        }
+                    }
+                }
+                off += idx + 4;
+                if off >= page.len() {
+                    break;
                 }
             }
             if scan < CODE_ITEM_BACKSCAN_STEP {

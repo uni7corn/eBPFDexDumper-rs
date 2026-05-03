@@ -45,6 +45,7 @@ static bool art_layout_loaded = false;
 #define NATIVE_SOURCE_MEMMOVE 5
 #define NATIVE_SOURCE_MEMSET 6
 #define NATIVE_MAX_COPY_SIZE 0x40000000
+#define NATIVE_MIN_COPY_SIZE 0x70
 
 static __always_inline bool valid_uid(uid_t uid) {
 	return uid != INVALID_UID_PID;
@@ -117,6 +118,26 @@ static __always_inline void submit_layout_debug_event(
     bpf_ringbuf_submit(evt, BPF_RB_FORCE_WAKEUP);
 }
 
+static __always_inline int looks_like_dex_header(u64 addr, u32 dex_header_file_size_offset, u32 *size)
+{
+    *size = 0;
+    if (addr == 0) {
+        return 0;
+    }
+    u32 magic = 0;
+    if (bpf_probe_read_user(&magic, sizeof(u32), (void *)untag((void *)addr)) != 0) {
+        return 0;
+    }
+    if (magic != DEX_MAGIC) {
+        return 0;
+    }
+    bpf_probe_read_user(
+        size,
+        sizeof(u32),
+        (void *)((unsigned long)untag((void *)addr) + dex_header_file_size_offset));
+    return *size >= NATIVE_MIN_COPY_SIZE && *size <= MAX_DEX_FILE_SIZE;
+}
+
 static __always_inline void submit_native_buffer_event(
     u32 pid,
     u64 addr,
@@ -125,7 +146,7 @@ static __always_inline void submit_native_buffer_event(
     u32 prot,
     u32 flags)
 {
-    if (!native_buffer_scan_enable || addr == 0 || size == 0 || size > NATIVE_MAX_COPY_SIZE) {
+    if (!native_buffer_scan_enable || addr == 0 || size < NATIVE_MIN_COPY_SIZE || size > NATIVE_MAX_COPY_SIZE) {
         return;
     }
     struct native_buffer_event_t *evt = (struct native_buffer_event_t *)bpf_ringbuf_reserve(
@@ -142,6 +163,8 @@ static __always_inline void submit_native_buffer_event(
     bpf_ringbuf_submit(evt, BPF_RB_FORCE_WAKEUP);
 }
 
+static __always_inline void submit_dex_chunks_partial(u64 begin, u32 pid, u32 size);
+
 static __always_inline int read_code_item_from_art_method(
     u64 art_method_ptr,
     struct art_layout_t *layout,
@@ -156,6 +179,29 @@ static __always_inline int read_code_item_from_art_method(
     }
     *code_item_ptr = *code_item_ptr & -1;
     return *code_item_ptr != 0;
+}
+
+static __always_inline void submit_dex_from_begin(u32 pid, u64 begin, u32 size)
+{
+    if (begin == 0 || size == 0 || size > MAX_DEX_FILE_SIZE) {
+        return;
+    }
+
+    u32 exist = 1;
+    u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
+    if (value != 0 && *value == 1) {
+        return;
+    }
+
+    struct dex_event_data_t *dex_evt = (struct dex_event_data_t *)bpf_ringbuf_reserve(&events, sizeof(struct dex_event_data_t), 0);
+    if (dex_evt) {
+        dex_evt->begin = begin;
+        dex_evt->pid = pid;
+        dex_evt->size = size;
+        bpf_ringbuf_submit(dex_evt, BPF_RB_FORCE_WAKEUP);
+    }
+    submit_dex_chunks_partial(begin, pid, size);
+    bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
 }
 
 static __always_inline int read_dex_from_art_method(
@@ -588,7 +634,7 @@ int uprobe_libart_nterpOpInvoke(struct pt_regs *ctx)
     return handle_art_method(pid, art_method_ptr);
 }
 
-// DexFile::DexFile constructor. On AArch64 C++ ABI, x0 is this.
+// DexFile::DexFile constructor. On AArch64 C++ ABI, x1 is base.
 SEC("uprobe/libart_dexFileCtor")
 int uprobe_libart_dexFileCtor(struct pt_regs *ctx)
 {
@@ -598,40 +644,11 @@ int uprobe_libart_dexFileCtor(struct pt_regs *ctx)
     }
 
     struct art_layout_t *layout = get_art_layout();
-    unsigned char *dex_file_ptr = (unsigned char *)PT_REGS_PARM1(ctx);
-    dex_file_ptr = (unsigned char *)untag(dex_file_ptr);
-
-    u64 begin = 0;
+    u64 begin = (u64)PT_REGS_PARM2(ctx);
     u32 size = 0;
-    bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + layout->dex_file_begin_offset);
-    bpf_probe_read_user(
-        &size,
-        sizeof(u32),
-        (void *)((unsigned long)untag((void *)begin) + layout->dex_header_file_size_offset));
-
-    if (begin == 0 || size == 0 || size > MAX_DEX_FILE_SIZE) {
-        return 0;
+    if (looks_like_dex_header(begin, layout->dex_header_file_size_offset, &size)) {
+        submit_dex_from_begin(pid, begin, size);
     }
-    u32 magic = 0;
-    bpf_probe_read_user(&magic, sizeof(u32), (void *)untag((void *)begin));
-    if (magic != DEX_MAGIC) {
-        return 0;
-    }
-
-    u32 exist = 1;
-    u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
-    if (value != 0 && *value == 1) {
-        return 0;
-    }
-    struct dex_event_data_t *dex_evt = (struct dex_event_data_t *)bpf_ringbuf_reserve(&events, sizeof(struct dex_event_data_t), 0);
-    if (dex_evt) {
-        dex_evt->begin = begin;
-        dex_evt->pid = pid;
-        dex_evt->size = size;
-        bpf_ringbuf_submit(dex_evt, BPF_RB_FORCE_WAKEUP);
-    }
-    submit_dex_chunks_partial(begin, pid, size);
-    bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
     return 0;
 }
 
@@ -662,7 +679,11 @@ int uretprobe_libc_memcpy(struct pt_regs *ctx)
     if (!args) {
         return 0;
     }
-    submit_native_buffer_event((u32)pid_tgid, args->dst, args->size, args->source, 0, 0);
+    struct art_layout_t *layout = get_art_layout();
+    u32 dex_size = 0;
+    if (looks_like_dex_header(args->dst, layout->dex_header_file_size_offset, &dex_size)) {
+        submit_native_buffer_event((u32)pid_tgid, args->dst, dex_size, args->source, 0, 0);
+    }
     bpf_map_delete_elem(&native_copy_args_map, &pid_tgid);
     return 0;
 }
@@ -694,7 +715,11 @@ int uretprobe_libc_memmove(struct pt_regs *ctx)
     if (!args) {
         return 0;
     }
-    submit_native_buffer_event((u32)pid_tgid, args->dst, args->size, args->source, 0, 0);
+    struct art_layout_t *layout = get_art_layout();
+    u32 dex_size = 0;
+    if (looks_like_dex_header(args->dst, layout->dex_header_file_size_offset, &dex_size)) {
+        submit_native_buffer_event((u32)pid_tgid, args->dst, dex_size, args->source, 0, 0);
+    }
     bpf_map_delete_elem(&native_copy_args_map, &pid_tgid);
     return 0;
 }
