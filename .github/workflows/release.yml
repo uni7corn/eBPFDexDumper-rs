@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and Publish Android ARM64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install LLVM clang
+        run: sudo apt-get update && sudo apt-get install -y clang llvm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Android target
+        run: rustup target add aarch64-linux-android
+
+      - name: Install Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: Configure Android linker
+        run: |
+          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android23-clang" >> "$GITHUB_ENV"
+
+      - name: Package release
+        run: ./scripts/package-release.sh
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            dist/eBPFDexDumper_android_arm64
+            dist/eBPFDexDumper_android_arm64.sha256
+            dist/eBPFDexDumper_android_arm64.tar.gz
