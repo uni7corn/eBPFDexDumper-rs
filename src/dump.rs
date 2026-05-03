@@ -444,9 +444,9 @@ mod imp {
 
         let release = fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
         let asset = if release.contains("rockchip") {
-            include_bytes!("../../assets/rock5b-5.10-arm64_min.btf").as_slice()
+            include_bytes!("../assets/rock5b-5.10-arm64_min.btf").as_slice()
         } else {
-            include_bytes!("../../assets/a12-5.10-arm64_min.btf").as_slice()
+            include_bytes!("../assets/a12-5.10-arm64_min.btf").as_slice()
         };
 
         match Btf::parse(asset, Endianness::Little) {
