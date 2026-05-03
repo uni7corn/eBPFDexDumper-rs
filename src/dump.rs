@@ -11,6 +11,11 @@ pub struct DumpConfig {
     pub execute_offset: Option<u64>,
     pub nterp_offset: Option<u64>,
     pub runtime_layout: Option<crate::art::ArtRuntimeLayout>,
+    pub debug_layout: bool,
+    pub code_item_fallback: bool,
+    pub maps_scan: bool,
+    pub native_buffer_scan: bool,
+    pub libc: Option<PathBuf>,
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -36,6 +41,20 @@ mod imp {
     const DEX_CHUNK_HEADER_SIZE: usize = 24;
     const METHOD_EVENT_HEADER_SIZE: usize = 40;
     const READ_FAILURE_HEADER_SIZE: usize = 24;
+    const LAYOUT_DEBUG_EVENT_SIZE: usize = 40;
+    const NATIVE_BUFFER_EVENT_SIZE: usize = 32;
+    const DEX_HEADER_FILE_SIZE_OFFSET: usize = 0x20;
+    const DEX_HEADER_SIZE_OFFSET: usize = 0x24;
+    const DEX_HEADER_ENDIAN_TAG_OFFSET: usize = 0x28;
+    const DEX_HEADER_MAP_OFF_OFFSET: usize = 0x34;
+    const DEX_HEADER_SIZE: u32 = 0x70;
+    const DEX_ENDIAN_CONSTANT: u32 = 0x1234_5678;
+    const MAX_DEX_FILE_SIZE: u32 = 0x4000_0000;
+    const CODE_ITEM_BACKSCAN_LIMIT: u64 = 64 * 1024 * 1024;
+    const CODE_ITEM_BACKSCAN_STEP: u64 = 0x1000;
+    const MAPS_SCAN_MAX_REGION: u64 = 512 * 1024 * 1024;
+    const NATIVE_BUFFER_SCAN_LIMIT: u64 = 64 * 1024 * 1024;
+    const NATIVE_BUFFER_SCAN_STEP: u64 = 0x1000;
     static RUNNING: AtomicBool = AtomicBool::new(true);
 
     #[repr(C)]
@@ -43,6 +62,10 @@ mod imp {
     struct BpfConfig {
         uid: u32,
         pid: i32,
+        code_item_fallback: u32,
+        debug_layout: u32,
+        native_buffer_scan: u32,
+        reserved: u32,
     }
 
     unsafe impl Pod for BpfConfig {}
@@ -207,7 +230,75 @@ mod imp {
             }
         }
 
+        fn handle_layout_debug_event(&self, data: &[u8]) {
+            let Some(evt) = LayoutDebugEvent::parse(data) else {
+                eprintln!("Layout debug event too short: {} bytes", data.len());
+                return;
+            };
+            if self.trace {
+                println!(
+                    "layout event pid={} art_method=0x{:x} code_item=0x{:x} begin=0x{:x} size={} reason={} source={}",
+                    evt.pid,
+                    evt.art_method_ptr,
+                    evt.code_item_ptr,
+                    evt.begin,
+                    evt.size,
+                    evt.reason,
+                    evt.source
+                );
+            }
+            if evt.code_item_ptr == 0 {
+                return;
+            }
+            match dump_dex_from_code_item(evt.pid, evt.code_item_ptr) {
+                Ok(Some((begin, size, bytes))) => self.save_dex(begin, size, bytes),
+                Ok(None) => {
+                    if self.trace {
+                        eprintln!(
+                            "code item fallback did not find dex header for pid={} code_item=0x{:x}",
+                            evt.pid, evt.code_item_ptr
+                        );
+                    }
+                }
+                Err(err) => eprintln!(
+                    "code item fallback failed for pid={} code_item=0x{:x}: {err:#}",
+                    evt.pid, evt.code_item_ptr
+                ),
+            }
+        }
+
+        fn handle_native_buffer_event(&self, data: &[u8]) {
+            let Some(evt) = NativeBufferEvent::parse(data) else {
+                eprintln!("Native buffer event too short: {} bytes", data.len());
+                return;
+            };
+            if self.trace {
+                println!(
+                    "native buffer event pid={} addr=0x{:x} size=0x{:x} source={} prot=0x{:x} flags=0x{:x}",
+                    evt.pid, evt.addr, evt.size, evt.source, evt.prot, evt.flags
+                );
+            }
+            match dump_dex_from_native_buffer(evt.pid, evt.addr, evt.size) {
+                Ok(found) => {
+                    for (begin, size, bytes) in found {
+                        self.save_dex(begin, size, bytes);
+                    }
+                }
+                Err(err) => {
+                    if self.trace {
+                        eprintln!(
+                            "native buffer scan failed for pid={} addr=0x{:x} size=0x{:x}: {err:#}",
+                            evt.pid, evt.addr, evt.size
+                        );
+                    }
+                }
+            }
+        }
+
         fn save_dex(&self, begin: u64, size: u32, bytes: Vec<u8>) {
+            if self.dex_cache.read().unwrap().contains_key(&begin) {
+                return;
+            }
             if let Err(err) = DexParser::new(&bytes) {
                 eprintln!("Failed to parse dumped dex 0x{begin:x}: {err}");
             }
@@ -287,6 +378,21 @@ mod imp {
             }
             Ok(())
         }
+
+        fn scan_uid_maps_once(&self, uid: u32) {
+            match scan_uid_maps(uid) {
+                Ok(found) => {
+                    for (begin, size, bytes) in found {
+                        self.save_dex(begin, size, bytes);
+                    }
+                }
+                Err(err) => {
+                    if self.trace {
+                        eprintln!("maps scan skipped: {err:#}");
+                    }
+                }
+            }
+        }
     }
 
     pub fn run(config: DumpConfig) -> Result<()> {
@@ -309,6 +415,7 @@ mod imp {
             targets.execute_nterp_with_clinit,
         );
         print_target("VerifyClass", targets.verify_class);
+        print_target("DexFile::DexFile", targets.dex_file_ctor);
         println!(
             "[+] nterp_op_invoke_* pattern targets: {}",
             targets.nterp_invoke_addrs.len()
@@ -323,6 +430,22 @@ mod imp {
             })?,
         };
         println!("[+] ART runtime layout: {}", runtime_layout.summary());
+        println!(
+            "[+] CodeItem fallback: {}",
+            if config.code_item_fallback {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        println!(
+            "[+] Native buffer scan: {}",
+            if config.native_buffer_scan {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
 
         let asset_btf = load_asset_btf();
         let mut loader = EbpfLoader::new();
@@ -341,6 +464,10 @@ mod imp {
             BpfConfig {
                 uid: config.uid,
                 pid: 0,
+                code_item_fallback: u32::from(config.code_item_fallback),
+                debug_layout: u32::from(config.debug_layout),
+                native_buffer_scan: u32::from(config.native_buffer_scan),
+                reserved: 0,
             },
             0,
         )?;
@@ -399,8 +526,31 @@ mod imp {
                 );
             }
         }
+        if let Some(target) = targets.dex_file_ctor {
+            if let Err(err) = attach_uprobe(
+                &mut ebpf,
+                "uprobe_libart_dexFileCtor",
+                &config.libart,
+                target.addr,
+            ) {
+                eprintln!(
+                    "[-] failed to attach DexFile::DexFile at 0x{:x}: {err:#}",
+                    target.addr
+                );
+            }
+        }
+        if config.native_buffer_scan {
+            if let Some(libc_path) = resolve_libc_path(config.libc.as_deref()) {
+                attach_native_buffer_probes(&mut ebpf, &libc_path);
+            } else {
+                eprintln!("[-] libc not found; native buffer scan disabled");
+            }
+        }
 
         let state = Arc::new(DumpState::new(config.out.clone(), config.trace));
+        if config.maps_scan {
+            state.scan_uid_maps_once(config.uid);
+        }
         RUNNING.store(true, Ordering::SeqCst);
         install_signal_handlers();
 
@@ -418,6 +568,14 @@ mod imp {
             ebpf.take_map("read_failures")
                 .context("read_failures map not found")?,
         )?;
+        let mut layout_debug_events = RingBuf::try_from(
+            ebpf.take_map("layout_debug_events")
+                .context("layout_debug_events map not found")?,
+        )?;
+        let mut native_buffer_events = RingBuf::try_from(
+            ebpf.take_map("native_buffer_events")
+                .context("native_buffer_events map not found")?,
+        )?;
 
         println!("eBPF DexDumper started successfully");
         while RUNNING.load(Ordering::SeqCst) {
@@ -425,6 +583,12 @@ mod imp {
             drain_ring(&mut method_events, |data| state.handle_method_event(data));
             drain_ring(&mut dex_chunks, |data| state.handle_dex_chunk(data));
             drain_ring(&mut read_failures, |data| state.handle_read_failure(data));
+            drain_ring(&mut layout_debug_events, |data| {
+                state.handle_layout_debug_event(data)
+            });
+            drain_ring(&mut native_buffer_events, |data| {
+                state.handle_native_buffer_event(data)
+            });
             thread::sleep(Duration::from_millis(50));
         }
 
@@ -433,6 +597,12 @@ mod imp {
         drain_ring(&mut method_events, |data| state.handle_method_event(data));
         drain_ring(&mut dex_chunks, |data| state.handle_dex_chunk(data));
         drain_ring(&mut read_failures, |data| state.handle_read_failure(data));
+        drain_ring(&mut layout_debug_events, |data| {
+            state.handle_layout_debug_event(data)
+        });
+        drain_ring(&mut native_buffer_events, |data| {
+            state.handle_native_buffer_event(data)
+        });
         state.flush_json()?;
         if config.auto_fix {
             println!("[+] Auto-fixing DEX files...");
@@ -460,6 +630,101 @@ mod imp {
         }
         program.attach(None, offset, target, None)?;
         Ok(())
+    }
+
+    fn attach_uretprobe(
+        ebpf: &mut aya::Ebpf,
+        program_name: &str,
+        target: &std::path::Path,
+        offset: u64,
+    ) -> Result<()> {
+        let program: &mut UProbe = ebpf
+            .program_mut(program_name)
+            .with_context(|| format!("{program_name} not found"))?
+            .try_into()?;
+        match program.load() {
+            Ok(()) | Err(ProgramError::AlreadyLoaded) => {}
+            Err(err) => return Err(err.into()),
+        }
+        program.attach(None, offset, target, None)?;
+        Ok(())
+    }
+
+    fn attach_native_buffer_probes(ebpf: &mut aya::Ebpf, libc_path: &std::path::Path) {
+        let probes = [
+            (
+                "memcpy",
+                "uprobe_libc_memcpy",
+                Some("uretprobe_libc_memcpy"),
+            ),
+            (
+                "memmove",
+                "uprobe_libc_memmove",
+                Some("uretprobe_libc_memmove"),
+            ),
+            ("mmap", "uprobe_libc_mmap", Some("uretprobe_libc_mmap")),
+            ("mmap64", "uprobe_libc_mmap", Some("uretprobe_libc_mmap")),
+            ("mprotect", "uprobe_libc_mprotect", None),
+        ];
+        let mut attached = 0usize;
+        for (symbol, entry_program, ret_program) in probes {
+            let Some(offset) = find_elf_symbol(libc_path, symbol) else {
+                continue;
+            };
+            let entry_result = attach_uprobe(ebpf, entry_program, libc_path, offset);
+            match entry_result {
+                Ok(()) => attached += 1,
+                Err(err) => {
+                    eprintln!(
+                        "[-] failed to attach native probe {entry_program}:{symbol} at 0x{offset:x}: {err:#}"
+                    );
+                    continue;
+                }
+            }
+            if let Some(ret_program) = ret_program {
+                if let Err(err) = attach_uretprobe(ebpf, ret_program, libc_path, offset) {
+                    eprintln!(
+                        "[-] failed to attach native retprobe {ret_program}:{symbol} at 0x{offset:x}: {err:#}"
+                    );
+                }
+            }
+        }
+        println!(
+            "[+] Native libc probes attached: {} ({})",
+            attached,
+            libc_path.display()
+        );
+    }
+
+    fn resolve_libc_path(explicit: Option<&std::path::Path>) -> Option<PathBuf> {
+        if let Some(path) = explicit {
+            if path.exists() {
+                return Some(path.to_path_buf());
+            }
+            eprintln!("[-] requested libc path does not exist: {}", path.display());
+            return None;
+        }
+        [
+            "/apex/com.android.runtime/lib64/bionic/libc.so",
+            "/system/lib64/libc.so",
+            "/apex/com.android.runtime/lib/bionic/libc.so",
+            "/system/lib/libc.so",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.exists())
+    }
+
+    fn find_elf_symbol(path: &std::path::Path, name: &str) -> Option<u64> {
+        use object::{Object, ObjectSymbol};
+        let bytes = fs::read(path).ok()?;
+        let file = object::File::parse(bytes.as_slice()).ok()?;
+        for symbol in file.dynamic_symbols().chain(file.symbols()) {
+            if symbol.is_definition() && symbol.name().ok() == Some(name) {
+                return Some(symbol.address());
+            }
+        }
+        None
     }
 
     fn drain_ring<T: std::borrow::Borrow<MapData>, F: FnMut(&[u8])>(
@@ -616,6 +881,309 @@ mod imp {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    struct LayoutDebugEvent {
+        art_method_ptr: u64,
+        code_item_ptr: u64,
+        begin: u64,
+        pid: u32,
+        size: u32,
+        reason: u32,
+        source: u32,
+    }
+
+    impl LayoutDebugEvent {
+        fn parse(data: &[u8]) -> Option<Self> {
+            if data.len() < LAYOUT_DEBUG_EVENT_SIZE {
+                return None;
+            }
+            Some(Self {
+                art_method_ptr: le64(data, 0)?,
+                code_item_ptr: le64(data, 8)?,
+                begin: le64(data, 16)?,
+                pid: le32(data, 24)?,
+                size: le32(data, 28)?,
+                reason: le32(data, 32)?,
+                source: le32(data, 36)?,
+            })
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct NativeBufferEvent {
+        addr: u64,
+        size: u64,
+        pid: u32,
+        source: u32,
+        prot: u32,
+        flags: u32,
+    }
+
+    impl NativeBufferEvent {
+        fn parse(data: &[u8]) -> Option<Self> {
+            if data.len() < NATIVE_BUFFER_EVENT_SIZE {
+                return None;
+            }
+            Some(Self {
+                addr: le64(data, 0)?,
+                size: le64(data, 8)?,
+                pid: le32(data, 16)?,
+                source: le32(data, 20)?,
+                prot: le32(data, 24)?,
+                flags: le32(data, 28)?,
+            })
+        }
+    }
+
+    fn dump_dex_from_code_item(
+        pid: u32,
+        code_item_ptr: u64,
+    ) -> Result<Option<(u64, u32, Vec<u8>)>> {
+        if code_item_ptr == 0 {
+            return Ok(None);
+        }
+        let mut scan = code_item_ptr & !(CODE_ITEM_BACKSCAN_STEP - 1);
+        let scan_floor = code_item_ptr.saturating_sub(CODE_ITEM_BACKSCAN_LIMIT);
+        while scan >= scan_floor {
+            if let Ok(header) = read_remote_mem(pid, scan, DEX_HEADER_SIZE) {
+                if let Some(size) = validate_dex_header_contains(&header, scan, code_item_ptr) {
+                    let bytes = read_remote_mem(pid, scan, size)
+                        .with_context(|| format!("read dex from 0x{scan:x}, size 0x{size:x}"))?;
+                    if DexParser::new(&bytes).is_ok() {
+                        return Ok(Some((scan, size, bytes)));
+                    }
+                }
+            }
+            if scan < CODE_ITEM_BACKSCAN_STEP {
+                break;
+            }
+            scan -= CODE_ITEM_BACKSCAN_STEP;
+        }
+        Ok(None)
+    }
+
+    fn dump_dex_from_native_buffer(
+        pid: u32,
+        addr: u64,
+        size: u64,
+    ) -> Result<Vec<(u64, u32, Vec<u8>)>> {
+        if addr == 0 || size == 0 {
+            return Ok(Vec::new());
+        }
+        let end = addr
+            .checked_add(size.min(NATIVE_BUFFER_SCAN_LIMIT))
+            .context("native buffer address overflow")?;
+        let mut found = Vec::new();
+
+        if let Ok(header) = read_remote_mem(pid, addr, DEX_HEADER_SIZE) {
+            if let Some(file_size) = validate_dex_header(&header) {
+                if addr + file_size as u64 <= end {
+                    let bytes = read_remote_mem(pid, addr, file_size)
+                        .with_context(|| format!("read native dex from 0x{addr:x}"))?;
+                    if DexParser::new(&bytes).is_ok() {
+                        found.push((addr, file_size, bytes));
+                        return Ok(found);
+                    }
+                }
+            }
+        }
+
+        scan_native_range_for_dex(pid, addr, end, &mut found);
+        Ok(found)
+    }
+
+    fn scan_native_range_for_dex(
+        pid: u32,
+        start: u64,
+        end: u64,
+        found: &mut Vec<(u64, u32, Vec<u8>)>,
+    ) {
+        let mut pos = start;
+        while pos + DEX_HEADER_SIZE as u64 <= end {
+            let remaining = end.saturating_sub(pos);
+            let read_len = remaining.min(NATIVE_BUFFER_SCAN_STEP) as u32;
+            let Ok(page) = read_remote_mem(pid, pos, read_len) else {
+                pos = pos.saturating_add(NATIVE_BUFFER_SCAN_STEP);
+                continue;
+            };
+            let mut off = 0usize;
+            while let Some(idx) = find_subslice(&page[off..], b"dex\n") {
+                let begin = pos + (off + idx) as u64;
+                if begin + DEX_HEADER_SIZE as u64 > end {
+                    break;
+                }
+                if let Ok(header) = read_remote_mem(pid, begin, DEX_HEADER_SIZE) {
+                    if let Some(size) = validate_dex_header(&header) {
+                        if begin + size as u64 <= end {
+                            if let Ok(bytes) = read_remote_mem(pid, begin, size) {
+                                if DexParser::new(&bytes).is_ok() {
+                                    found.push((begin, size, bytes));
+                                }
+                            }
+                        }
+                    }
+                }
+                off += idx + 4;
+                if off >= page.len() {
+                    break;
+                }
+            }
+            pos = pos.saturating_add(NATIVE_BUFFER_SCAN_STEP);
+        }
+    }
+
+    fn validate_dex_header(header: &[u8]) -> Option<u32> {
+        if header.len() < DEX_HEADER_SIZE as usize {
+            return None;
+        }
+        if !header.starts_with(b"dex\n") {
+            return None;
+        }
+        let file_size = le32(header, DEX_HEADER_FILE_SIZE_OFFSET)?;
+        if !(DEX_HEADER_SIZE..=MAX_DEX_FILE_SIZE).contains(&file_size) {
+            return None;
+        }
+        let header_size = le32(header, DEX_HEADER_SIZE_OFFSET)?;
+        if header_size != DEX_HEADER_SIZE {
+            return None;
+        }
+        let endian_tag = le32(header, DEX_HEADER_ENDIAN_TAG_OFFSET)?;
+        if endian_tag != DEX_ENDIAN_CONSTANT {
+            return None;
+        }
+        let map_off = le32(header, DEX_HEADER_MAP_OFF_OFFSET)?;
+        if map_off != 0 && map_off >= file_size {
+            return None;
+        }
+        Some(file_size)
+    }
+
+    fn validate_dex_header_contains(header: &[u8], begin: u64, addr: u64) -> Option<u32> {
+        let file_size = validate_dex_header(header)?;
+        let dex_end = begin.checked_add(file_size as u64)?;
+        if addr < begin || addr >= dex_end {
+            return None;
+        }
+        Some(file_size)
+    }
+
+    fn scan_uid_maps(uid: u32) -> Result<Vec<(u64, u32, Vec<u8>)>> {
+        let mut found = Vec::new();
+        for pid in pids_for_uid(uid)? {
+            match scan_process_maps(pid) {
+                Ok(mut dexes) => found.append(&mut dexes),
+                Err(err) => eprintln!("maps scan failed for pid {pid}: {err:#}"),
+            }
+        }
+        Ok(found)
+    }
+
+    fn pids_for_uid(uid: u32) -> Result<Vec<u32>> {
+        let mut pids = Vec::new();
+        for entry in fs::read_dir("/proc").context("read /proc")? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(pid) = name.parse::<u32>() else {
+                continue;
+            };
+            let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+            if status.lines().any(|line| uid_line_matches(line, uid)) {
+                pids.push(pid);
+            }
+        }
+        Ok(pids)
+    }
+
+    fn uid_line_matches(line: &str, uid: u32) -> bool {
+        let Some(rest) = line.strip_prefix("Uid:") else {
+            return false;
+        };
+        rest.split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            == Some(uid)
+    }
+
+    fn scan_process_maps(pid: u32) -> Result<Vec<(u64, u32, Vec<u8>)>> {
+        let maps = fs::read_to_string(format!("/proc/{pid}/maps"))
+            .with_context(|| format!("read /proc/{pid}/maps"))?;
+        let mut found = Vec::new();
+        for line in maps.lines() {
+            let Some(region) = parse_readable_map_region(line) else {
+                continue;
+            };
+            if region.end <= region.start || region.end - region.start > MAPS_SCAN_MAX_REGION {
+                continue;
+            }
+            scan_region_for_dex(pid, region.start, region.end, &mut found);
+        }
+        Ok(found)
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct MapRegion {
+        start: u64,
+        end: u64,
+    }
+
+    fn parse_readable_map_region(line: &str) -> Option<MapRegion> {
+        let mut parts = line.split_whitespace();
+        let range = parts.next()?;
+        let perms = parts.next()?;
+        if !perms.starts_with('r') {
+            return None;
+        }
+        let (start, end) = range.split_once('-')?;
+        Some(MapRegion {
+            start: u64::from_str_radix(start, 16).ok()?,
+            end: u64::from_str_radix(end, 16).ok()?,
+        })
+    }
+
+    fn scan_region_for_dex(pid: u32, start: u64, end: u64, found: &mut Vec<(u64, u32, Vec<u8>)>) {
+        let mut pos = start;
+        while pos + DEX_HEADER_SIZE as u64 <= end {
+            let Ok(page) = read_remote_mem(pid, pos, CODE_ITEM_BACKSCAN_STEP as u32) else {
+                pos = pos.saturating_add(CODE_ITEM_BACKSCAN_STEP);
+                continue;
+            };
+            let mut off = 0usize;
+            while let Some(idx) = find_subslice(&page[off..], b"dex\n") {
+                let begin = pos + (off + idx) as u64;
+                if begin + DEX_HEADER_SIZE as u64 > end {
+                    break;
+                }
+                if let Ok(header) = read_remote_mem(pid, begin, DEX_HEADER_SIZE) {
+                    if let Some(size) = validate_dex_header(&header) {
+                        if begin + size as u64 <= end {
+                            if let Ok(bytes) = read_remote_mem(pid, begin, size) {
+                                if DexParser::new(&bytes).is_ok() {
+                                    found.push((begin, size, bytes));
+                                }
+                            }
+                        }
+                    }
+                }
+                off += idx + 4;
+                if off >= page.len() {
+                    break;
+                }
+            }
+            pos = pos.saturating_add(CODE_ITEM_BACKSCAN_STEP);
+        }
+    }
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() {
+            return Some(0);
+        }
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
     fn read_remote_mem(pid: u32, remote_addr: u64, len: u32) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; len as usize];
         let mut local = libc::iovec {
@@ -691,6 +1259,7 @@ mod imp {
             targets.execute_nterp_with_clinit,
         );
         print_target("VerifyClass", targets.verify_class);
+        print_target("DexFile::DexFile", targets.dex_file_ctor);
         println!(
             "[+] nterp_op_invoke_* pattern targets: {}",
             targets.nterp_invoke_addrs.len()
@@ -706,7 +1275,16 @@ mod imp {
         };
         println!("[+] ART runtime layout: {}", runtime_layout.summary());
         println!("[+] Filtering on uid {}", config.uid);
-        let _ = (config.package_name, config.trace, config.auto_fix);
+        let _ = (
+            config.package_name,
+            config.trace,
+            config.auto_fix,
+            config.debug_layout,
+            config.code_item_fallback,
+            config.maps_scan,
+            config.native_buffer_scan,
+            config.libc,
+        );
         anyhow::bail!("live dump is available only when built for Linux/Android")
     }
 

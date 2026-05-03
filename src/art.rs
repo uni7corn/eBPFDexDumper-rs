@@ -4,8 +4,14 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
+fn log_resolve(quiet: bool, args: std::fmt::Arguments<'_>) {
+    if !quiet {
+        println!("{args}");
+    }
+}
+
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, serde::Serialize, PartialEq, Eq)]
 pub struct ArtRuntimeLayout {
     pub shadow_frame_method_offset: u32,
     pub art_method_declaring_class_offset: u32,
@@ -52,7 +58,7 @@ impl ArtRuntimeLayout {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, serde::Serialize, PartialEq, Eq)]
 pub enum TargetSource {
     Manual,
     Symbol,
@@ -72,7 +78,7 @@ impl std::fmt::Display for TargetSource {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, serde::Serialize, PartialEq, Eq)]
 pub struct ResolvedTarget {
     pub addr: u64,
     pub source: TargetSource,
@@ -90,6 +96,7 @@ pub struct ArtHookTargets {
     pub execute_nterp: Option<ResolvedTarget>,
     pub execute_nterp_with_clinit: Option<ResolvedTarget>,
     pub verify_class: Option<ResolvedTarget>,
+    pub dex_file_ctor: Option<ResolvedTarget>,
     pub nterp_invoke_addrs: Vec<ResolvedTarget>,
 }
 
@@ -105,6 +112,33 @@ pub fn find_art_offsets(
     libart_path: &Path,
     manual_execute_offset: Option<u64>,
     manual_nterp_offset: Option<u64>,
+) -> Result<ArtHookTargets> {
+    find_art_offsets_inner(
+        libart_path,
+        manual_execute_offset,
+        manual_nterp_offset,
+        false,
+    )
+}
+
+pub fn find_art_offsets_quiet(
+    libart_path: &Path,
+    manual_execute_offset: Option<u64>,
+    manual_nterp_offset: Option<u64>,
+) -> Result<ArtHookTargets> {
+    find_art_offsets_inner(
+        libart_path,
+        manual_execute_offset,
+        manual_nterp_offset,
+        true,
+    )
+}
+
+fn find_art_offsets_inner(
+    libart_path: &Path,
+    manual_execute_offset: Option<u64>,
+    manual_nterp_offset: Option<u64>,
+    quiet: bool,
 ) -> Result<ArtHookTargets> {
     let bytes = fs::read(libart_path)
         .with_context(|| format!("failed to read {}", libart_path.display()))?;
@@ -143,16 +177,26 @@ pub fn find_art_offsets(
             && name.contains("11VerifyClass")
         {
             targets.verify_class = Some(ResolvedTarget::new(value, TargetSource::Symbol));
+            continue;
+        }
+        if targets.dex_file_ctor.is_none() && is_art_dex_file_constructor_symbol(&name) {
+            targets.dex_file_ctor = Some(ResolvedTarget::new(value, TargetSource::Symbol));
         }
     }
 
     if targets.execute.is_none() {
-        match find_execute_by_interpreting_string(&elf, &bytes) {
+        match find_execute_by_interpreting_string(&elf, &bytes, quiet) {
             Ok(addr) => {
                 targets.execute = Some(ResolvedTarget::new(addr, TargetSource::StringRef));
-                println!("[+] Execute found by 'Interpreting ' string at 0x{addr:x}");
+                log_resolve(
+                    quiet,
+                    format_args!("[+] Execute found by 'Interpreting ' string at 0x{addr:x}"),
+                );
             }
-            Err(err) => println!("[-] Execute not found by symbol or string reference: {err:#}"),
+            Err(err) => log_resolve(
+                quiet,
+                format_args!("[-] Execute not found by symbol or string reference: {err:#}"),
+            ),
         }
     }
 
@@ -162,16 +206,28 @@ pub fn find_art_offsets(
                 let addr = addrs[0];
                 targets.execute_nterp = Some(ResolvedTarget::new(addr, TargetSource::Pattern));
                 if addrs.len() > 1 {
-                    println!(
+                    log_resolve(
+                        quiet,
+                        format_args!(
                         "[!] ExecuteNterpImpl signature matched {} sites; using first: 0x{addr:x}",
                         addrs.len()
+                    ),
                     );
                 } else {
-                    println!("[+] ExecuteNterpImpl found by signature at 0x{addr:x}");
+                    log_resolve(
+                        quiet,
+                        format_args!("[+] ExecuteNterpImpl found by signature at 0x{addr:x}"),
+                    );
                 }
             }
-            Ok(_) => println!("[-] ExecuteNterpImpl not found by symbol or signature"),
-            Err(err) => println!("[-] ExecuteNterpImpl not found by symbol or signature: {err:#}"),
+            Ok(_) => log_resolve(
+                quiet,
+                format_args!("[-] ExecuteNterpImpl not found by symbol or signature"),
+            ),
+            Err(err) => log_resolve(
+                quiet,
+                format_args!("[-] ExecuteNterpImpl not found by symbol or signature: {err:#}"),
+            ),
         }
     }
 
@@ -183,18 +239,27 @@ pub fn find_art_offsets(
                     let addr = addrs[0];
                     found = Some(addr);
                     if addrs.len() > 1 {
-                        println!(
+                        log_resolve(quiet, format_args!(
                             "[!] ExecuteNterpWithClinitImpl branch scan matched {} sites; using first: 0x{addr:x}",
                             addrs.len()
-                        );
+                        ));
                     } else {
-                        println!(
-                            "[+] ExecuteNterpWithClinitImpl found by branch scan at 0x{addr:x}"
+                        log_resolve(
+                            quiet,
+                            format_args!(
+                                "[+] ExecuteNterpWithClinitImpl found by branch scan at 0x{addr:x}"
+                            ),
                         );
                     }
                 }
-                Ok(_) => println!("[-] ExecuteNterpWithClinitImpl not found by branch scan"),
-                Err(err) => println!("[-] ExecuteNterpWithClinitImpl branch scan failed: {err:#}"),
+                Ok(_) => log_resolve(
+                    quiet,
+                    format_args!("[-] ExecuteNterpWithClinitImpl not found by branch scan"),
+                ),
+                Err(err) => log_resolve(
+                    quiet,
+                    format_args!("[-] ExecuteNterpWithClinitImpl branch scan failed: {err:#}"),
+                ),
             }
         }
         if found.is_none() {
@@ -203,18 +268,27 @@ pub fn find_art_offsets(
                     let addr = addrs[0];
                     found = Some(addr);
                     if addrs.len() > 1 {
-                        println!(
+                        log_resolve(quiet, format_args!(
                             "[!] ExecuteNterpWithClinitImpl signature matched {} sites; using first: 0x{addr:x}",
                             addrs.len()
-                        );
+                        ));
                     } else {
-                        println!("[+] ExecuteNterpWithClinitImpl found by signature at 0x{addr:x}");
+                        log_resolve(
+                            quiet,
+                            format_args!(
+                                "[+] ExecuteNterpWithClinitImpl found by signature at 0x{addr:x}"
+                            ),
+                        );
                     }
                 }
-                Ok(_) => println!("[-] ExecuteNterpWithClinitImpl not found by signature"),
-                Err(err) => {
-                    println!("[-] ExecuteNterpWithClinitImpl signature scan failed: {err:#}")
-                }
+                Ok(_) => log_resolve(
+                    quiet,
+                    format_args!("[-] ExecuteNterpWithClinitImpl not found by signature"),
+                ),
+                Err(err) => log_resolve(
+                    quiet,
+                    format_args!("[-] ExecuteNterpWithClinitImpl signature scan failed: {err:#}"),
+                ),
             }
         }
         if let Some(addr) = found {
@@ -230,7 +304,10 @@ pub fn find_art_offsets(
                 .map(|addr| ResolvedTarget::new(addr, TargetSource::Pattern))
                 .collect();
         }
-        Err(err) => println!("[-] nterp_op_invoke_* pattern not found: {err:#}"),
+        Err(err) => log_resolve(
+            quiet,
+            format_args!("[-] nterp_op_invoke_* pattern not found: {err:#}"),
+        ),
     }
 
     if !targets.has_main_entry() {
@@ -239,7 +316,10 @@ pub fn find_art_offsets(
         );
     }
     if targets.verify_class.is_none() {
-        println!("[!] VerifyClass not found; continuing without VerifyClass hook");
+        log_resolve(
+            quiet,
+            format_args!("[!] VerifyClass not found; continuing without VerifyClass hook"),
+        );
     }
 
     Ok(targets)
@@ -292,6 +372,11 @@ fn is_target_art_symbol(name: &str) -> bool {
             && name.contains("8verifier")
             && name.contains("13ClassVerifier")
             && name.contains("11VerifyClass"))
+        || is_art_dex_file_constructor_symbol(name)
+}
+
+fn is_art_dex_file_constructor_symbol(name: &str) -> bool {
+    name.starts_with("_ZN3art7DexFileC1") || name.starts_with("_ZN3art7DexFileC2")
 }
 
 pub const NTERP_OP_INVOKE_SIG: &[u8] = &[0x03, 0x0c, 0x40, 0xf9, 0x5f, 0x00, 0x03, 0xeb];
@@ -339,10 +424,13 @@ pub fn find_pattern_uaddrs(elf: &Elf<'_>, bytes: &[u8], pattern: &[u8]) -> Resul
     Ok(addrs)
 }
 
-fn find_execute_by_interpreting_string(elf: &Elf<'_>, bytes: &[u8]) -> Result<u64> {
+fn find_execute_by_interpreting_string(elf: &Elf<'_>, bytes: &[u8], quiet: bool) -> Result<u64> {
     let str_addr = find_string_in_elf(elf, bytes, b"Interpreting ")
         .context("failed to find 'Interpreting ' string")?;
-    println!("[+] Found 'Interpreting ' string at 0x{str_addr:x}");
+    log_resolve(
+        quiet,
+        format_args!("[+] Found 'Interpreting ' string at 0x{str_addr:x}"),
+    );
 
     let (code_vaddr, code_data) = executable_load_segments(elf)
         .find_map(|ph| segment_data(bytes, ph).ok().map(|data| (ph.p_vaddr, data)))
@@ -385,9 +473,12 @@ fn find_execute_by_interpreting_string(elf: &Elf<'_>, bytes: &[u8]) -> Result<u6
     if ref_addrs.is_empty() {
         anyhow::bail!("no code references to 'Interpreting ' string found");
     }
-    println!(
-        "[+] Found {} references to 'Interpreting ' string",
-        ref_addrs.len()
+    log_resolve(
+        quiet,
+        format_args!(
+            "[+] Found {} references to 'Interpreting ' string",
+            ref_addrs.len()
+        ),
     );
 
     for ref_addr in ref_addrs {
@@ -395,7 +486,12 @@ fn find_execute_by_interpreting_string(elf: &Elf<'_>, bytes: &[u8]) -> Result<u6
             continue;
         };
         if check_for_6th_parameter(code_data, code_vaddr, func_addr) {
-            println!("[+] Execute function found at 0x{func_addr:x} (6 parameters, uses W5)");
+            log_resolve(
+                quiet,
+                format_args!(
+                    "[+] Execute function found at 0x{func_addr:x} (6 parameters, uses W5)"
+                ),
+            );
             return Ok(func_addr);
         }
     }

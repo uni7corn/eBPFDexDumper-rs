@@ -12,11 +12,17 @@ ARM64 `vmlinux.h` 和最小 BTF 资源。
 - 支持 Android ARM64 设备上的 `dump` 命令。
 - 通过 eBPF ring buffer 接收 DEX、方法和读取失败事件。
 - 分块重建 DEX，并在 eBPF 分块读取失败时自动使用 `process_vm_readv` 兜底。
+- ART 对象链失效时，可通过 eBPF 捕获的 `CodeItem*` 触发用户态内存反扫，从目标进程
+  内存中重新定位 DEX header 并 dump。
+- 启动时会对目标 UID 的进程做一次 `/proc/<pid>/maps` 可读区域扫描，作为不依赖 ART
+  私有对象布局的兜底。
 - 导出方法字节码 JSON，用于后续 DEX 修复。
 - 支持 `fix` 命令，将记录到的方法字节码回填到 DEX，并输出到 `fix/` 目录。
 - 支持从 `libart.so` 中自动定位 ART `Execute`、`ExecuteNterpImpl`、
   `ExecuteNterpWithClinitImpl` 和 `VerifyClass` hook 目标。
 - ART 运行时对象字段通过 layout 下发给 eBPF，并带有 DEX magic 校验和有限候选扫描兜底。
+- 已按 AOSP `android16-release` 核对 arm64 nterp：`ExecuteNterpWithClinitImpl`
+  仍跳转到 `ExecuteNterpImpl`，`ArtMethod::data_` 在运行时仍是 `CodeItem*`。
 - 支持 GitHub Actions CI 和 Android ARM64 Release 打包。
 
 ## 环境要求
@@ -107,6 +113,12 @@ su -c './eBPFDexDumper dump -n com.example.app --no-clean-oat --no-auto-fix'
 ./eBPFDexDumper offsets -l /apex/com.android.art/lib64/libart.so
 ```
 
+输出 JSON：
+
+```bash
+./eBPFDexDumper offsets -l /apex/com.android.art/lib64/libart.so --json
+```
+
 如需调试厂商 ROM 的 ART 字段布局，可以手动覆盖 layout。参数顺序为：
 `ShadowFrame.method,ArtMethod.declaring_class,ArtMethod.dex_method_index,ArtMethod.data,Class.dex_cache,DexCache.dex_file,DexFile.begin,DexHeader.file_size,CodeItem.insns_size,CodeItem.insns`。
 
@@ -114,6 +126,49 @@ su -c './eBPFDexDumper dump -n com.example.app --no-clean-oat --no-auto-fix'
 ./eBPFDexDumper offsets -l /apex/com.android.art/lib64/libart.so \
   --art-layout 0x8,0x0,0x8,0x10,0x10,0x10,0x8,0x20,0xc,0x10
 ```
+
+`dump` 使用多路径互补策略：
+
+- fast path：从 `ArtMethod -> Class -> DexCache -> DexFile -> begin` 直接定位 DEX。
+- CodeItem fallback：ART 对象链解析不到 DEX 时，eBPF 上报 `CodeItem*`，用户态通过
+  `process_vm_readv` 向前扫描 DEX header。
+- maps scan：启动时扫描目标 UID 进程的可读内存区域，查找合法 DEX header。
+- native buffer scan：hook bionic libc 的 `mmap`/`mprotect`/`memcpy`/`memmove`，
+  将疑似 native 解密缓冲区交给用户态验证。
+- hook coverage：同时尝试 `Execute`、`ExecuteNterpImpl`、`ExecuteNterpWithClinitImpl`
+  和 nterp invoke 入口，覆盖解释执行路径。
+
+调试新系统版本或厂商 ROM 时可加 `--debug-layout` 打印诊断事件。需要降低开销时可加
+`--no-code-item-fallback`、`--no-maps-scan` 或 `--no-native-buffer-scan`。如果 libc
+不在默认路径，可用 `--libc /apex/com.android.runtime/lib64/bionic/libc.so` 指定。
+
+## 加固与自定义加载器覆盖
+
+当前实现覆盖的是 DEX 最终进入 ART 或出现在进程内存中的场景：
+
+- 自定义 `ClassLoader` 只要最终走 ART `DexFile` / nterp / interpreter，通常可由
+  `DexFile::DexFile`、ART fast path 或 CodeItem fallback 捕获。
+- `InMemoryDexClassLoader`、native 解密后交给 ART 的 loader，通常可由 `DexFile`
+  构造路径或 maps scan 捕获。
+- 如果加固只在 native 层短暂解密单个 class/method，且内存里不保留连续合法 DEX，
+  native buffer scan 会尝试从 `mmap`/`mprotect`/`memcpy`/`memmove` 的候选缓冲区中
+  识别完整 DEX；如果壳只生成碎片化方法体，仍需要按壳定点 hook 解密函数。
+
+因此本项目默认使用“ART 入口 + DexFile 构造 + CodeItem 反扫 + maps 扫描 +
+native buffer 扫描”的组合；更深的函数级解密点仍属于按壳适配。
+
+## 五层方案 Review
+
+1. ART fast path：稳定性最好，依赖字段布局；当前通过 ELF/source pattern 自动解析，
+   失败时可用 `--art-layout` 兜底。
+2. DexFile 构造：覆盖 `InMemoryDexClassLoader` 等先构造 ART `DexFile` 的路径；缺点是
+   stripped ROM 上构造函数符号可能不存在，缺失时自动跳过。
+3. CodeItem 反扫：能绕开 `Class/DexCache` 布局变化，适合 Android 13+ nterp；缺点是只在
+   方法执行后触发，未执行类不会被它发现。
+4. maps 扫描：不依赖 ART 符号，能补启动前已加载 DEX；缺点是一次性扫描有开销，默认限制
+   单 region 512MB，可用 `--no-maps-scan` 关闭。
+5. native buffer 扫描：更贴近自定义 native loader，能抓到交给 ART 前的连续 DEX 缓冲区；
+   缺点是 `memcpy/memmove` 调用频繁且只能识别完整 DEX，碎片化 class 抽取仍要定点适配。
 
 ## 常见日志
 

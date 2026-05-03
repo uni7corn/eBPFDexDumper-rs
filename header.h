@@ -14,6 +14,10 @@
 struct config_t{
 	uid_t uid;
 	pid_t pid;
+	u32 code_item_fallback;
+	u32 debug_layout;
+	u32 native_buffer_scan;
+	u32 reserved;
 };
 
 struct art_layout_t {
@@ -64,6 +68,25 @@ struct dex_read_failure_t {
     u32 failed_offset; // offset where read failed
 };
 
+struct layout_debug_event_t {
+    u64 art_method_ptr;
+    u64 code_item_ptr;
+    u64 begin;
+    u32 pid;
+    u32 size;
+    u32 reason;
+    u32 source;
+};
+
+struct native_buffer_event_t {
+    u64 addr;
+    u64 size;
+    u32 pid;
+    u32 source;
+    u32 prot;
+    u32 flags;
+};
+
 typedef struct simple_buf {
     u8 buf[MAX_PERCPU_BUFSIZE];
     u32 offset;
@@ -94,6 +117,18 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 20);
 } read_failures SEC(".maps");
+
+// Optional layout diagnostics for adapting new ART builds.
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 20);
+} layout_debug_events SEC(".maps");
+
+// Candidate native memory buffers that may contain a DEX before ART sees it.
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 20);
+} native_buffer_events SEC(".maps");
 
 // Config map
 struct
@@ -149,6 +184,34 @@ struct
     __type(key, u64);
     __type(value, u32);
 } dexProgress_map SEC(".maps");
+
+struct native_copy_args_t {
+    u64 dst;
+    u64 size;
+    u32 source;
+};
+
+struct native_alloc_args_t {
+    u64 size;
+    u32 prot;
+    u32 flags;
+};
+
+struct
+{
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, u64);
+    __type(value, struct native_copy_args_t);
+} native_copy_args_map SEC(".maps");
+
+struct
+{
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, u64);
+    __type(value, struct native_alloc_args_t);
+} native_alloc_args_map SEC(".maps");
 
 
 #define INVALID_UID_PID ((uid_t)-1)

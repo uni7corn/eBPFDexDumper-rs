@@ -9,11 +9,16 @@ const struct method_event_data_t *unused_method_event_data_t __attribute__((unus
 const buf_t *unused_buf_t __attribute__((unused));
 const struct dex_chunk_event_t *unused_dex_chunk_event_t __attribute__((unused));
 const struct dex_read_failure_t *unused_dex_read_failure_t __attribute__((unused));
+const struct layout_debug_event_t *unused_layout_debug_event_t __attribute__((unused));
+const struct native_buffer_event_t *unused_native_buffer_event_t __attribute__((unused));
 
 static int config_loaded = 0;
 static bool filter_enable = false;
 static uid_t targ_uid = INVALID_UID_PID;
 static pid_t targ_pid = INVALID_UID_PID;
+static bool code_item_fallback_enable = true;
+static bool layout_debug_enable = false;
+static bool native_buffer_scan_enable = true;
 static struct art_layout_t cached_art_layout = {};
 static bool art_layout_loaded = false;
 
@@ -29,6 +34,17 @@ static bool art_layout_loaded = false;
 #define DEFAULT_CODE_ITEM_INSNS_OFFSET 0x10
 #define DEX_MAGIC 0x0a786564
 #define MAX_DEX_FILE_SIZE 0x40000000
+#define LAYOUT_REASON_ART_CHAIN_FAILED 1
+#define LAYOUT_REASON_CODE_ITEM_FAILED 2
+#define LAYOUT_SOURCE_ART_CHAIN 1
+#define LAYOUT_SOURCE_CODE_ITEM 2
+#define NATIVE_SOURCE_MMAP 1
+#define NATIVE_SOURCE_MPROTECT 2
+#define NATIVE_SOURCE_MEMFD_CREATE 3
+#define NATIVE_SOURCE_MEMCPY 4
+#define NATIVE_SOURCE_MEMMOVE 5
+#define NATIVE_SOURCE_MEMSET 6
+#define NATIVE_MAX_COPY_SIZE 0x40000000
 
 static __always_inline bool valid_uid(uid_t uid) {
 	return uid != INVALID_UID_PID;
@@ -67,6 +83,79 @@ static __always_inline struct art_layout_t *get_art_layout(void)
         art_layout_loaded = true;
     }
     return &cached_art_layout;
+}
+
+static __always_inline void submit_layout_debug_event(
+    u32 pid,
+    u64 art_method_ptr,
+    u64 code_item_ptr,
+    u64 begin,
+    u32 size,
+    u32 reason,
+    u32 source)
+{
+    if (!layout_debug_enable) {
+        if (reason == 0 || !code_item_fallback_enable) {
+            return;
+        }
+    }
+    if (!code_item_fallback_enable && source == LAYOUT_SOURCE_CODE_ITEM) {
+        return;
+    }
+    struct layout_debug_event_t *evt = (struct layout_debug_event_t *)bpf_ringbuf_reserve(
+        &layout_debug_events, sizeof(struct layout_debug_event_t), 0);
+    if (!evt) {
+        return;
+    }
+    evt->art_method_ptr = art_method_ptr;
+    evt->code_item_ptr = code_item_ptr;
+    evt->begin = begin;
+    evt->pid = pid;
+    evt->size = size;
+    evt->reason = reason;
+    evt->source = source;
+    bpf_ringbuf_submit(evt, BPF_RB_FORCE_WAKEUP);
+}
+
+static __always_inline void submit_native_buffer_event(
+    u32 pid,
+    u64 addr,
+    u64 size,
+    u32 source,
+    u32 prot,
+    u32 flags)
+{
+    if (!native_buffer_scan_enable || addr == 0 || size == 0 || size > NATIVE_MAX_COPY_SIZE) {
+        return;
+    }
+    struct native_buffer_event_t *evt = (struct native_buffer_event_t *)bpf_ringbuf_reserve(
+        &native_buffer_events, sizeof(struct native_buffer_event_t), 0);
+    if (!evt) {
+        return;
+    }
+    evt->addr = addr;
+    evt->size = size;
+    evt->pid = pid;
+    evt->source = source;
+    evt->prot = prot;
+    evt->flags = flags;
+    bpf_ringbuf_submit(evt, BPF_RB_FORCE_WAKEUP);
+}
+
+static __always_inline int read_code_item_from_art_method(
+    u64 art_method_ptr,
+    struct art_layout_t *layout,
+    u64 *code_item_ptr)
+{
+    *code_item_ptr = 0;
+    if (bpf_probe_read_user(
+            code_item_ptr,
+            sizeof(u64),
+            (void *)(art_method_ptr + layout->art_method_data_offset)) != 0) {
+        return 0;
+    }
+    *code_item_ptr = *code_item_ptr & -1;
+    return *code_item_ptr != 0;
 }
 
 static __always_inline int read_dex_from_art_method(
@@ -184,13 +273,7 @@ u32 read_method_bytecode(u64 art_method_ptr, u32 *codeitem_size) {
     // Get the CodeItem pointer from ArtMethod
     struct art_layout_t *layout = get_art_layout();
     u64 code_item_ptr = 0;
-    if (bpf_probe_read_user(&code_item_ptr, sizeof(u64), (void *)(art_method_ptr + layout->art_method_data_offset)) != 0) {
-        return 0;
-    }
-    
-    // clear the lowest bit
-    code_item_ptr = code_item_ptr & -1;
-    if (code_item_ptr == 0) {
+    if (!read_code_item_from_art_method(art_method_ptr, layout, &code_item_ptr)) {
         return 0; // No bytecode (native method or abstract)
     }
     
@@ -368,6 +451,76 @@ static __always_inline void submit_dex_chunks_partial(u64 begin, u32 pid, u32 si
     bpf_map_update_elem(&dexProgress_map, &begin, &next_off, BPF_ANY);
 }
 
+static __always_inline int handle_art_method(u32 pid, u64 art_method_ptr)
+{
+    if (filter_art(art_method_ptr)) {
+        return 0;
+    }
+
+    struct art_layout_t *layout = get_art_layout();
+    u32 dex_method_index = 0;
+    u64 begin = 0;
+    u32 size = 0;
+    if (!resolve_dex_from_art_method(art_method_ptr, layout, &begin, &size, &dex_method_index)) {
+        u64 code_item_ptr = 0;
+        if (read_code_item_from_art_method(art_method_ptr, layout, &code_item_ptr)) {
+            submit_layout_debug_event(
+                pid,
+                art_method_ptr,
+                code_item_ptr,
+                0,
+                0,
+                LAYOUT_REASON_ART_CHAIN_FAILED,
+                LAYOUT_SOURCE_CODE_ITEM);
+        } else {
+            submit_layout_debug_event(
+                pid,
+                art_method_ptr,
+                0,
+                0,
+                0,
+                LAYOUT_REASON_CODE_ITEM_FAILED,
+                LAYOUT_SOURCE_CODE_ITEM);
+        }
+        return 0;
+    }
+
+    submit_layout_debug_event(
+        pid,
+        art_method_ptr,
+        0,
+        begin,
+        size,
+        0,
+        LAYOUT_SOURCE_ART_CHAIN);
+
+    u8 ch = 0;
+    bpf_probe_read_user(&ch, sizeof(u8), (void *)begin);
+    if (begin == 0 || size == 0 || ch != 0x64) {
+        return 0;
+    }
+
+    u32 exist = 1;
+    u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
+    if (value == 0 || *value != 1) {
+        struct dex_event_data_t *dex_evt = (struct dex_event_data_t *)bpf_ringbuf_reserve(&events, sizeof(struct dex_event_data_t), 0);
+        if (dex_evt) {
+            dex_evt->begin = begin;
+            dex_evt->pid = pid;
+            dex_evt->size = size;
+            bpf_ringbuf_submit(dex_evt, BPF_RB_FORCE_WAKEUP);
+        }
+        submit_dex_chunks_partial(begin, pid, size);
+        bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
+    }
+
+    u32 codeitem_size = 0;
+    read_method_bytecode(art_method_ptr, &codeitem_size);
+    submit_method_event_with_bytecode(
+        begin, pid, size, art_method_ptr, dex_method_index, codeitem_size);
+    return 0;
+}
+
 static __always_inline
 bool trace_allowed(u32 pid, u32 uid)
 {   
@@ -377,6 +530,9 @@ bool trace_allowed(u32 pid, u32 uid)
         if (conf){
             targ_uid = conf->uid;
             targ_pid = conf->pid;
+            code_item_fallback_enable = conf->code_item_fallback != 0;
+            layout_debug_enable = conf->debug_layout != 0;
+            native_buffer_scan_enable = conf->native_buffer_scan != 0;
         }
     }
 
@@ -391,7 +547,6 @@ bool trace_allowed(u32 pid, u32 uid)
 SEC("uprobe/libart_execute")
 int uprobe_libart_execute(struct pt_regs *ctx)
 {
-
     u32 pid = bpf_get_current_pid_tgid();
     if (!trace_allowed(0, bpf_get_current_uid_gid())){
         return 0;
@@ -405,46 +560,7 @@ int uprobe_libart_execute(struct pt_regs *ctx)
         &art_method_ptr,
         sizeof(u64),
         shadow_frame_ptr + layout->shadow_frame_method_offset);
-    if (filter_art(art_method_ptr)) return 0;
-
-    u32 dex_method_index = 0;
-    u64 begin = 0;
-    u32 size = 0;
-    u8 ch = 0;
-    resolve_dex_from_art_method(art_method_ptr, layout, &begin, &size, &dex_method_index);
-
-    // read one byte to check if readable
-    bpf_probe_read_user(&ch, sizeof(u8), (void *)begin);
-
-    if(begin != 0 && size != 0) {
-        if (size < 0){
-            return 0;
-        }
-
-        if (ch == 0x64) {
-            u32 exist = 1;
-            u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
-
-            if (value == 0 || *value != 1){
-                struct dex_event_data_t *dex_evt = (struct dex_event_data_t *)bpf_ringbuf_reserve(&events, sizeof(struct dex_event_data_t), 0);
-                if (dex_evt) {
-                    dex_evt->begin = begin;
-                    dex_evt->pid = pid;
-                    dex_evt->size = size;
-                    bpf_ringbuf_submit(dex_evt, BPF_RB_FORCE_WAKEUP);
-                }
-                // submit dex chunks progressively via ringbuf
-                submit_dex_chunks_partial(begin, pid, size);
-                bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
-            }
-        }
-
-        u32 codeitem_size = 0;
-        read_method_bytecode(art_method_ptr, &codeitem_size);
-        submit_method_event_with_bytecode(begin, pid, size, art_method_ptr, dex_method_index, codeitem_size);
-    }
-
-    return 0;
+    return handle_art_method(pid, art_method_ptr);
 }
 
 SEC("uprobe/libart_executeNterpImpl")
@@ -456,46 +572,7 @@ int uprobe_libart_executeNterpImpl(struct pt_regs *ctx)
     }
 
     u64 art_method_ptr = (u64)PT_REGS_PARM1(ctx);
-    if (filter_art(art_method_ptr)) return 0;
-
-    struct art_layout_t *layout = get_art_layout();
-    u32 dex_method_index = 0;
-    u64 begin = 0;
-    u32 size = 0;
-    u8 ch = 0;
-    resolve_dex_from_art_method(art_method_ptr, layout, &begin, &size, &dex_method_index);
-
-    // read one byte to check if readable
-    bpf_probe_read_user(&ch, sizeof(u8), (void *)begin);
-
-    if(begin != 0 && size != 0) {
-        if (size < 0){
-            return 0;
-        }
-
-        if (ch == 0x64) {
-            u32 exist = 1;
-            u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
-
-            if (value == 0 || *value != 1){
-                struct dex_event_data_t *dex_evt = (struct dex_event_data_t *)bpf_ringbuf_reserve(&events, sizeof(struct dex_event_data_t), 0);
-                if (dex_evt) {
-                    dex_evt->begin = begin;
-                    dex_evt->pid = pid;
-                    dex_evt->size = size;
-                    bpf_ringbuf_submit(dex_evt, BPF_RB_FORCE_WAKEUP);
-                }
-                // submit dex chunks progressively via ringbuf
-                submit_dex_chunks_partial(begin, pid, size);
-                bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
-            }
-        }
-
-        u32 codeitem_size = 0;
-        read_method_bytecode(art_method_ptr, &codeitem_size);
-        submit_method_event_with_bytecode(begin, pid, size, art_method_ptr, dex_method_index, codeitem_size);
-    }
-    return 0;
+    return handle_art_method(pid, art_method_ptr);
 }
 
 // NterpOpInvoke
@@ -508,44 +585,172 @@ int uprobe_libart_nterpOpInvoke(struct pt_regs *ctx)
     }
 
     u64 art_method_ptr = (u64)PT_REGS_PARM1(ctx);
-    if (filter_art(art_method_ptr)) return 0;
+    return handle_art_method(pid, art_method_ptr);
+}
+
+// DexFile::DexFile constructor. On AArch64 C++ ABI, x0 is this.
+SEC("uprobe/libart_dexFileCtor")
+int uprobe_libart_dexFileCtor(struct pt_regs *ctx)
+{
+    u32 pid = bpf_get_current_pid_tgid();
+    if (!trace_allowed(0, bpf_get_current_uid_gid())){
+        return 0;
+    }
 
     struct art_layout_t *layout = get_art_layout();
-    u32 dex_method_index = 0;
+    unsigned char *dex_file_ptr = (unsigned char *)PT_REGS_PARM1(ctx);
+    dex_file_ptr = (unsigned char *)untag(dex_file_ptr);
+
     u64 begin = 0;
     u32 size = 0;
-    u8 ch = 0;
-    resolve_dex_from_art_method(art_method_ptr, layout, &begin, &size, &dex_method_index);
-    // read one byte to check if readable
-    bpf_probe_read_user(&ch, sizeof(u8), (void *)begin);
+    bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + layout->dex_file_begin_offset);
+    bpf_probe_read_user(
+        &size,
+        sizeof(u32),
+        (void *)((unsigned long)untag((void *)begin) + layout->dex_header_file_size_offset));
 
-    if(begin != 0 && size != 0) {
-        if (size < 0){
-            return 0;
-        }
-
-        if (ch == 0x64) {
-            u32 exist = 1;
-            u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
-
-            if (value == 0 || *value != 1){
-                struct dex_event_data_t *dex_evt = (struct dex_event_data_t *)bpf_ringbuf_reserve(&events, sizeof(struct dex_event_data_t), 0);
-                if (dex_evt) {
-                    dex_evt->begin = begin;
-                    dex_evt->pid = pid;
-                    dex_evt->size = size;
-                    bpf_ringbuf_submit(dex_evt, BPF_RB_FORCE_WAKEUP);
-                }
-                // submit dex chunks progressively via ringbuf
-                submit_dex_chunks_partial(begin, pid, size);
-                bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
-            }
-        }
-
-        u32 codeitem_size = 0;
-        read_method_bytecode(art_method_ptr, &codeitem_size);
-        submit_method_event_with_bytecode(begin, pid, size, art_method_ptr, dex_method_index, codeitem_size);
+    if (begin == 0 || size == 0 || size > MAX_DEX_FILE_SIZE) {
+        return 0;
     }
+    u32 magic = 0;
+    bpf_probe_read_user(&magic, sizeof(u32), (void *)untag((void *)begin));
+    if (magic != DEX_MAGIC) {
+        return 0;
+    }
+
+    u32 exist = 1;
+    u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
+    if (value != 0 && *value == 1) {
+        return 0;
+    }
+    struct dex_event_data_t *dex_evt = (struct dex_event_data_t *)bpf_ringbuf_reserve(&events, sizeof(struct dex_event_data_t), 0);
+    if (dex_evt) {
+        dex_evt->begin = begin;
+        dex_evt->pid = pid;
+        dex_evt->size = size;
+        bpf_ringbuf_submit(dex_evt, BPF_RB_FORCE_WAKEUP);
+    }
+    submit_dex_chunks_partial(begin, pid, size);
+    bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
+    return 0;
+}
+
+SEC("uprobe/libc_memcpy")
+int uprobe_libc_memcpy(struct pt_regs *ctx)
+{
+    if (!trace_allowed(0, bpf_get_current_uid_gid())){
+        return 0;
+    }
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u64 size = (u64)PT_REGS_PARM3(ctx);
+    if (size == 0 || size > NATIVE_MAX_COPY_SIZE) {
+        return 0;
+    }
+    struct native_copy_args_t args = {};
+    args.dst = (u64)PT_REGS_PARM1(ctx);
+    args.size = size;
+    args.source = NATIVE_SOURCE_MEMCPY;
+    bpf_map_update_elem(&native_copy_args_map, &pid_tgid, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/libc_memcpy")
+int uretprobe_libc_memcpy(struct pt_regs *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct native_copy_args_t *args = (struct native_copy_args_t *)bpf_map_lookup_elem(&native_copy_args_map, &pid_tgid);
+    if (!args) {
+        return 0;
+    }
+    submit_native_buffer_event((u32)pid_tgid, args->dst, args->size, args->source, 0, 0);
+    bpf_map_delete_elem(&native_copy_args_map, &pid_tgid);
+    return 0;
+}
+
+SEC("uprobe/libc_memmove")
+int uprobe_libc_memmove(struct pt_regs *ctx)
+{
+    if (!trace_allowed(0, bpf_get_current_uid_gid())){
+        return 0;
+    }
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u64 size = (u64)PT_REGS_PARM3(ctx);
+    if (size == 0 || size > NATIVE_MAX_COPY_SIZE) {
+        return 0;
+    }
+    struct native_copy_args_t args = {};
+    args.dst = (u64)PT_REGS_PARM1(ctx);
+    args.size = size;
+    args.source = NATIVE_SOURCE_MEMMOVE;
+    bpf_map_update_elem(&native_copy_args_map, &pid_tgid, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/libc_memmove")
+int uretprobe_libc_memmove(struct pt_regs *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct native_copy_args_t *args = (struct native_copy_args_t *)bpf_map_lookup_elem(&native_copy_args_map, &pid_tgid);
+    if (!args) {
+        return 0;
+    }
+    submit_native_buffer_event((u32)pid_tgid, args->dst, args->size, args->source, 0, 0);
+    bpf_map_delete_elem(&native_copy_args_map, &pid_tgid);
+    return 0;
+}
+
+SEC("uprobe/libc_mmap")
+int uprobe_libc_mmap(struct pt_regs *ctx)
+{
+    if (!trace_allowed(0, bpf_get_current_uid_gid())){
+        return 0;
+    }
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct native_alloc_args_t args = {};
+    args.size = (u64)PT_REGS_PARM2(ctx);
+    args.prot = (u32)PT_REGS_PARM3(ctx);
+    args.flags = (u32)PT_REGS_PARM4(ctx);
+    if (args.size == 0 || args.size > NATIVE_MAX_COPY_SIZE) {
+        return 0;
+    }
+    bpf_map_update_elem(&native_alloc_args_map, &pid_tgid, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/libc_mmap")
+int uretprobe_libc_mmap(struct pt_regs *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct native_alloc_args_t *args = (struct native_alloc_args_t *)bpf_map_lookup_elem(&native_alloc_args_map, &pid_tgid);
+    if (!args) {
+        return 0;
+    }
+    u64 addr = (u64)PT_REGS_RC(ctx);
+    if (addr != (u64)-1) {
+        submit_native_buffer_event((u32)pid_tgid, addr, args->size, NATIVE_SOURCE_MMAP, args->prot, args->flags);
+    }
+    bpf_map_delete_elem(&native_alloc_args_map, &pid_tgid);
+    return 0;
+}
+
+SEC("uprobe/libc_mprotect")
+int uprobe_libc_mprotect(struct pt_regs *ctx)
+{
+    if (!trace_allowed(0, bpf_get_current_uid_gid())){
+        return 0;
+    }
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u64 addr = (u64)PT_REGS_PARM1(ctx);
+    u64 size = (u64)PT_REGS_PARM2(ctx);
+    u32 prot = (u32)PT_REGS_PARM3(ctx);
+    submit_native_buffer_event((u32)pid_tgid, addr, size, NATIVE_SOURCE_MPROTECT, prot, 0);
+    return 0;
+}
+
+SEC("uretprobe/libc_memfd_create")
+int uretprobe_libc_memfd_create(struct pt_regs *ctx)
+{
+    (void)ctx;
     return 0;
 }
 

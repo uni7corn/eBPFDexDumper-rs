@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ebpf_dex_dumper_rs::{art, dump, fix, platform};
+use serde::Serialize;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -78,6 +79,26 @@ struct DumpArgs {
     /// Override ART runtime layout offsets as ten comma-separated integers.
     #[arg(long, value_parser = parse_art_layout)]
     art_layout: Option<art::ArtRuntimeLayout>,
+
+    /// Enable CodeItem fallback events and ART layout diagnostics.
+    #[arg(long)]
+    debug_layout: bool,
+
+    /// Disable user-space DEX header backscan from CodeItem events.
+    #[arg(long)]
+    no_code_item_fallback: bool,
+
+    /// Disable one-shot /proc/<pid>/maps DEX scan for the target UID.
+    #[arg(long)]
+    no_maps_scan: bool,
+
+    /// Disable libc native buffer probes for mmap/mprotect/memcpy/memmove.
+    #[arg(long)]
+    no_native_buffer_scan: bool,
+
+    /// Path to libc.so used for native buffer probes.
+    #[arg(long)]
+    libc: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -104,6 +125,22 @@ struct OffsetsArgs {
     /// Override ART runtime layout offsets as ten comma-separated integers.
     #[arg(long, value_parser = parse_art_layout)]
     art_layout: Option<art::ArtRuntimeLayout>,
+
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Serialize)]
+struct OffsetsJson {
+    execute: Option<art::ResolvedTarget>,
+    execute_nterp_impl: Option<art::ResolvedTarget>,
+    execute_nterp_with_clinit_impl: Option<art::ResolvedTarget>,
+    verify_class: Option<art::ResolvedTarget>,
+    dex_file_ctor: Option<art::ResolvedTarget>,
+    nterp_op_invoke: Vec<art::ResolvedTarget>,
+    runtime_layout: art::ArtRuntimeLayout,
+    android_16_notes: &'static str,
 }
 
 fn main() -> Result<()> {
@@ -116,27 +153,48 @@ fn main() -> Result<()> {
         }
         Some(Command::Fix(args)) => fix::fix_dex_directory(&args.dir),
         Some(Command::Offsets(args)) => {
-            let targets =
+            let targets = if args.json {
+                art::find_art_offsets_quiet(&args.libart, args.execute_offset, args.nterp_offset)
+            } else {
                 art::find_art_offsets(&args.libart, args.execute_offset, args.nterp_offset)
-                    .with_context(|| format!("failed to parse {}", args.libart.display()))?;
-            print_target("Execute", targets.execute);
-            print_target("ExecuteNterpImpl", targets.execute_nterp);
-            print_target(
-                "ExecuteNterpWithClinitImpl",
-                targets.execute_nterp_with_clinit,
-            );
-            print_target("VerifyClass", targets.verify_class);
-            println!(
-                "nterp_op_invoke_*: {} target(s)",
-                targets.nterp_invoke_addrs.len()
-            );
+            }
+            .with_context(|| format!("failed to parse {}", args.libart.display()))?;
             let runtime_layout = match args.art_layout {
                 Some(layout) => layout,
                 None => art::resolve_runtime_layout(&args.libart).with_context(|| {
                     format!("failed to resolve ART layout for {}", args.libart.display())
                 })?,
             };
-            println!("ART runtime layout: {}", runtime_layout.summary());
+            if args.json {
+                serde_json::to_writer_pretty(
+                    std::io::stdout(),
+                    &OffsetsJson {
+                        execute: targets.execute,
+                        execute_nterp_impl: targets.execute_nterp,
+                        execute_nterp_with_clinit_impl: targets.execute_nterp_with_clinit,
+                        verify_class: targets.verify_class,
+                        dex_file_ctor: targets.dex_file_ctor,
+                        nterp_op_invoke: targets.nterp_invoke_addrs,
+                        runtime_layout,
+                        android_16_notes: "android16-release keeps arm64 ExecuteNterpWithClinitImpl branching into ExecuteNterpImpl and ArtMethod::data_ as runtime CodeItem*",
+                    },
+                )?;
+                println!();
+            } else {
+                print_target("Execute", targets.execute);
+                print_target("ExecuteNterpImpl", targets.execute_nterp);
+                print_target(
+                    "ExecuteNterpWithClinitImpl",
+                    targets.execute_nterp_with_clinit,
+                );
+                print_target("VerifyClass", targets.verify_class);
+                print_target("DexFile::DexFile", targets.dex_file_ctor);
+                println!(
+                    "nterp_op_invoke_*: {} target(s)",
+                    targets.nterp_invoke_addrs.len()
+                );
+                println!("ART runtime layout: {}", runtime_layout.summary());
+            }
             Ok(())
         }
         Some(Command::Dump(args)) => {
@@ -170,6 +228,11 @@ fn main() -> Result<()> {
                 execute_offset: args.execute_offset,
                 nterp_offset: args.nterp_offset,
                 runtime_layout: args.art_layout,
+                debug_layout: args.debug_layout,
+                code_item_fallback: !args.no_code_item_fallback,
+                maps_scan: !args.no_maps_scan,
+                native_buffer_scan: !args.no_native_buffer_scan,
+                libc: args.libc,
             };
             dump::run(config)
         }
