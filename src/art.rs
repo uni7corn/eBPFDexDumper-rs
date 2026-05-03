@@ -5,76 +5,121 @@ use std::fs;
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ArtOffsets {
-    pub execute: u64,
-    pub execute_nterp: u64,
-    pub verify_class: u64,
+pub enum TargetSource {
+    Manual,
+    Symbol,
+    Pattern,
+    StringRef,
+}
+
+impl std::fmt::Display for TargetSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let source = match self {
+            TargetSource::Manual => "manual",
+            TargetSource::Symbol => "symbol",
+            TargetSource::Pattern => "pattern",
+            TargetSource::StringRef => "string-ref",
+        };
+        f.write_str(source)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedTarget {
+    pub addr: u64,
+    pub source: TargetSource,
+}
+
+impl ResolvedTarget {
+    fn new(addr: u64, source: TargetSource) -> Self {
+        Self { addr, source }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ArtHookTargets {
+    pub execute: Option<ResolvedTarget>,
+    pub execute_nterp: Option<ResolvedTarget>,
+    pub execute_nterp_with_clinit: Option<ResolvedTarget>,
+    pub verify_class: Option<ResolvedTarget>,
+    pub nterp_invoke_addrs: Vec<ResolvedTarget>,
+}
+
+impl ArtHookTargets {
+    pub fn has_main_entry(&self) -> bool {
+        self.execute.is_some()
+            || self.execute_nterp.is_some()
+            || self.execute_nterp_with_clinit.is_some()
+    }
 }
 
 pub fn find_art_offsets(
     libart_path: &Path,
     manual_execute_offset: Option<u64>,
     manual_nterp_offset: Option<u64>,
-) -> Result<ArtOffsets> {
+) -> Result<ArtHookTargets> {
     let bytes = fs::read(libart_path)
         .with_context(|| format!("failed to read {}", libart_path.display()))?;
     let elf = Elf::parse(&bytes).context("failed to parse ELF")?;
     let sym_map = parse_libart_symbols(&elf);
 
-    let mut execute = manual_execute_offset.unwrap_or(0);
-    let mut execute_nterp = manual_nterp_offset.unwrap_or(0);
-    let mut verify_class = 0;
+    let mut targets = ArtHookTargets {
+        execute: manual_execute_offset.map(|addr| ResolvedTarget::new(addr, TargetSource::Manual)),
+        execute_nterp: manual_nterp_offset
+            .map(|addr| ResolvedTarget::new(addr, TargetSource::Manual)),
+        ..Default::default()
+    };
 
     for (name, value) in sym_map {
-        if execute == 0
+        if targets.execute.is_none()
             && name.contains("3art")
             && name.contains("11interpreter")
             && name.contains("7Execute")
         {
-            execute = value;
+            targets.execute = Some(ResolvedTarget::new(value, TargetSource::Symbol));
             continue;
         }
-        if execute_nterp == 0 && name == "ExecuteNterpImpl" {
-            execute_nterp = value;
+        if targets.execute_nterp.is_none() && name == "ExecuteNterpImpl" {
+            targets.execute_nterp = Some(ResolvedTarget::new(value, TargetSource::Symbol));
             continue;
         }
-        if verify_class == 0
+        if targets.execute_nterp_with_clinit.is_none() && name == "ExecuteNterpWithClinitImpl" {
+            targets.execute_nterp_with_clinit =
+                Some(ResolvedTarget::new(value, TargetSource::Symbol));
+            continue;
+        }
+        if targets.verify_class.is_none()
             && name.contains("3art")
             && name.contains("8verifier")
             && name.contains("13ClassVerifier")
             && name.contains("11VerifyClass")
         {
-            verify_class = value;
+            targets.verify_class = Some(ResolvedTarget::new(value, TargetSource::Symbol));
         }
     }
 
-    if execute == 0 {
+    if targets.execute.is_none() {
         match find_execute_by_interpreting_string(&elf, &bytes) {
             Ok(addr) => {
-                execute = addr;
-                println!("[+] Execute found by 'Interpreting ' string at 0x{execute:x}");
+                targets.execute = Some(ResolvedTarget::new(addr, TargetSource::StringRef));
+                println!("[+] Execute found by 'Interpreting ' string at 0x{addr:x}");
             }
             Err(err) => println!("[-] Execute not found by symbol or string reference: {err:#}"),
         }
     }
 
-    if execute_nterp == 0 {
-        let nterp_sig = [
-            0xf0, 0x0b, 0x40, 0xd1, 0x1f, 0x02, 0x40, 0xb9, 0xff, 0x83, 0x02, 0xd1, 0xe8, 0x27,
-            0x00, 0x6d, 0xea, 0x2f, 0x01, 0x6d, 0xec, 0x37, 0x02, 0x6d, 0xee, 0x3f, 0x03, 0x6d,
-            0xf3, 0x53, 0x04, 0xa9, 0xf5, 0x5b, 0x05, 0xa9, 0xf7, 0x63, 0x06, 0xa9, 0xf9, 0x6b,
-            0x07, 0xa9, 0xfb, 0x73, 0x08, 0xa9, 0xfd, 0x7b, 0x09, 0xa9, 0x16, 0x08, 0x40, 0xf9,
-        ];
-        match find_pattern_uaddrs(&elf, &bytes, &nterp_sig) {
+    if targets.execute_nterp.is_none() {
+        match find_pattern_uaddrs(&elf, &bytes, EXECUTE_NTERP_IMPL_SIG) {
             Ok(addrs) if !addrs.is_empty() => {
-                execute_nterp = addrs[0];
+                let addr = addrs[0];
+                targets.execute_nterp = Some(ResolvedTarget::new(addr, TargetSource::Pattern));
                 if addrs.len() > 1 {
                     println!(
-                        "[!] ExecuteNterpImpl signature matched {} sites; using first: 0x{execute_nterp:x}",
+                        "[!] ExecuteNterpImpl signature matched {} sites; using first: 0x{addr:x}",
                         addrs.len()
                     );
                 } else {
-                    println!("[+] ExecuteNterpImpl found by signature at 0x{execute_nterp:x}");
+                    println!("[+] ExecuteNterpImpl found by signature at 0x{addr:x}");
                 }
             }
             Ok(_) => println!("[-] ExecuteNterpImpl not found by symbol or signature"),
@@ -82,17 +127,74 @@ pub fn find_art_offsets(
         }
     }
 
-    if execute == 0 || execute_nterp == 0 || verify_class == 0 {
-        anyhow::bail!(
-            "failed to parse libart.so offsets (Execute={execute:x}, Nterp={execute_nterp:x}, VerifyClass={verify_class:x})"
-        );
+    if targets.execute_nterp_with_clinit.is_none() {
+        let mut found = None;
+        if let Some(execute_nterp) = targets.execute_nterp {
+            match find_nterp_with_clinit_by_branch(&elf, &bytes, execute_nterp.addr) {
+                Ok(addrs) if !addrs.is_empty() => {
+                    let addr = addrs[0];
+                    found = Some(addr);
+                    if addrs.len() > 1 {
+                        println!(
+                            "[!] ExecuteNterpWithClinitImpl branch scan matched {} sites; using first: 0x{addr:x}",
+                            addrs.len()
+                        );
+                    } else {
+                        println!(
+                            "[+] ExecuteNterpWithClinitImpl found by branch scan at 0x{addr:x}"
+                        );
+                    }
+                }
+                Ok(_) => println!("[-] ExecuteNterpWithClinitImpl not found by branch scan"),
+                Err(err) => println!("[-] ExecuteNterpWithClinitImpl branch scan failed: {err:#}"),
+            }
+        }
+        if found.is_none() {
+            match find_pattern_uaddrs(&elf, &bytes, EXECUTE_NTERP_WITH_CLINIT_SIG) {
+                Ok(addrs) if !addrs.is_empty() => {
+                    let addr = addrs[0];
+                    found = Some(addr);
+                    if addrs.len() > 1 {
+                        println!(
+                            "[!] ExecuteNterpWithClinitImpl signature matched {} sites; using first: 0x{addr:x}",
+                            addrs.len()
+                        );
+                    } else {
+                        println!("[+] ExecuteNterpWithClinitImpl found by signature at 0x{addr:x}");
+                    }
+                }
+                Ok(_) => println!("[-] ExecuteNterpWithClinitImpl not found by signature"),
+                Err(err) => {
+                    println!("[-] ExecuteNterpWithClinitImpl signature scan failed: {err:#}")
+                }
+            }
+        }
+        if let Some(addr) = found {
+            targets.execute_nterp_with_clinit =
+                Some(ResolvedTarget::new(addr, TargetSource::Pattern));
+        }
     }
 
-    Ok(ArtOffsets {
-        execute,
-        execute_nterp,
-        verify_class,
-    })
+    match find_pattern_uaddrs(&elf, &bytes, NTERP_OP_INVOKE_SIG) {
+        Ok(addrs) => {
+            targets.nterp_invoke_addrs = addrs
+                .into_iter()
+                .map(|addr| ResolvedTarget::new(addr, TargetSource::Pattern))
+                .collect();
+        }
+        Err(err) => println!("[-] nterp_op_invoke_* pattern not found: {err:#}"),
+    }
+
+    if !targets.has_main_entry() {
+        anyhow::bail!(
+            "failed to locate any ART main entry in libart.so (Execute, ExecuteNterpImpl, ExecuteNterpWithClinitImpl)"
+        );
+    }
+    if targets.verify_class.is_none() {
+        println!("[!] VerifyClass not found; continuing without VerifyClass hook");
+    }
+
+    Ok(targets)
 }
 
 pub fn parse_libart_symbols(elf: &Elf<'_>) -> HashMap<String, u64> {
@@ -130,11 +232,25 @@ pub fn parse_libart_symbols(elf: &Elf<'_>) -> HashMap<String, u64> {
 fn is_target_art_symbol(name: &str) -> bool {
     (name.contains("3art") && name.contains("11interpreter") && name.contains("7Execute"))
         || name == "ExecuteNterpImpl"
+        || name == "ExecuteNterpWithClinitImpl"
         || (name.contains("3art")
             && name.contains("8verifier")
             && name.contains("13ClassVerifier")
             && name.contains("11VerifyClass"))
 }
+
+pub const NTERP_OP_INVOKE_SIG: &[u8] = &[0x03, 0x0c, 0x40, 0xf9, 0x5f, 0x00, 0x03, 0xeb];
+
+const EXECUTE_NTERP_IMPL_SIG: &[u8] = &[
+    0xf0, 0x0b, 0x40, 0xd1, 0x1f, 0x02, 0x40, 0xb9, 0xff, 0x83, 0x02, 0xd1, 0xe8, 0x27, 0x00, 0x6d,
+    0xea, 0x2f, 0x01, 0x6d, 0xec, 0x37, 0x02, 0x6d, 0xee, 0x3f, 0x03, 0x6d, 0xf3, 0x53, 0x04, 0xa9,
+    0xf5, 0x5b, 0x05, 0xa9, 0xf7, 0x63, 0x06, 0xa9, 0xf9, 0x6b, 0x07, 0xa9, 0xfb, 0x73, 0x08, 0xa9,
+    0xfd, 0x7b, 0x09, 0xa9, 0x16, 0x08, 0x40, 0xf9,
+];
+
+const EXECUTE_NTERP_WITH_CLINIT_SIG: &[u8] = &[
+    0x08, 0x00, 0x40, 0xb9, 0x09, 0x81, 0x40, 0x39, 0x3f, 0x05, 0x00, 0x71,
+];
 
 pub fn find_pattern_uaddrs(elf: &Elf<'_>, bytes: &[u8], pattern: &[u8]) -> Result<Vec<u64>> {
     if pattern.is_empty() {
@@ -297,6 +413,85 @@ fn check_for_6th_parameter(code_data: &[u8], code_vaddr: u64, func_addr: u64) ->
     false
 }
 
+fn find_nterp_with_clinit_by_branch(
+    elf: &Elf<'_>,
+    bytes: &[u8],
+    execute_nterp_addr: u64,
+) -> Result<Vec<u64>> {
+    let mut addrs = Vec::new();
+    let mut seen = BTreeSet::new();
+    for ph in executable_load_segments(elf) {
+        let data = segment_data(bytes, ph)?;
+        if data.len() < 8 {
+            continue;
+        }
+        for off in (0..data.len() - 8).step_by(4) {
+            let pc = ph.p_vaddr + off as u64;
+            let first = read_inst(data, off);
+            let second = read_inst(data, off + 4);
+            let Some(class_reg) = ldr_w_from_reg(first, 0) else {
+                continue;
+            };
+            if ldr_status_from_reg(second, class_reg).is_none() {
+                continue;
+            }
+            if branch_window_targets(data, ph.p_vaddr, off, execute_nterp_addr) && seen.insert(pc) {
+                addrs.push(pc);
+            }
+        }
+    }
+    if addrs.is_empty() {
+        anyhow::bail!("ExecuteNterpWithClinitImpl branch pattern not found");
+    }
+    Ok(addrs)
+}
+
+fn ldr_w_from_reg(inst: u32, expected_rn: u32) -> Option<u32> {
+    if (inst & 0xffc0_0000) != 0xb940_0000 {
+        return None;
+    }
+    let rn = (inst >> 5) & 0x1f;
+    (rn == expected_rn).then_some(inst & 0x1f)
+}
+
+fn ldr_status_from_reg(inst: u32, expected_rn: u32) -> Option<u32> {
+    // Android 14 reads a byte field, Android 15+ can read a packed 32-bit status field.
+    if (inst & 0xffc0_0000) != 0x3940_0000 && (inst & 0xffc0_0000) != 0xb940_0000 {
+        return None;
+    }
+    let rn = (inst >> 5) & 0x1f;
+    (rn == expected_rn).then_some(inst & 0x1f)
+}
+
+fn branch_window_targets(data: &[u8], code_vaddr: u64, start_off: usize, target: u64) -> bool {
+    let end = (start_off + 14 * 4).min(data.len());
+    for off in (start_off..end).step_by(4) {
+        let pc = code_vaddr + off as u64;
+        let inst = read_inst(data, off);
+        if branch_target(pc, inst) == Some(target) {
+            return true;
+        }
+    }
+    false
+}
+
+fn branch_target(pc: u64, inst: u32) -> Option<u64> {
+    if (inst & 0xfc00_0000) == 0x1400_0000 {
+        let imm = sign_extend((inst & 0x03ff_ffff) as i64, 26) << 2;
+        return Some(pc.wrapping_add(imm as u64));
+    }
+    if (inst & 0xff00_0010) == 0x5400_0000 {
+        let imm = sign_extend(((inst >> 5) & 0x7ffff) as i64, 19) << 2;
+        return Some(pc.wrapping_add(imm as u64));
+    }
+    None
+}
+
+fn sign_extend(value: i64, bits: u8) -> i64 {
+    let shift = 64 - bits;
+    (value << shift) >> shift
+}
+
 fn executable_load_segments<'a>(
     elf: &'a Elf<'a>,
 ) -> impl Iterator<Item = &'a goblin::elf::program_header::ProgramHeader> + 'a {
@@ -351,5 +546,43 @@ mod tests {
     #[test]
     fn finds_overlapping_subslice() {
         assert_eq!(find_subslice(b"aaaab", b"aab"), Some(2));
+    }
+
+    #[test]
+    fn recognizes_nterp_with_clinit_symbol() {
+        assert!(is_target_art_symbol("ExecuteNterpWithClinitImpl"));
+    }
+
+    #[test]
+    fn main_entry_check_does_not_require_verify_class() {
+        let targets = ArtHookTargets {
+            execute_nterp: Some(ResolvedTarget::new(0x1234, TargetSource::Symbol)),
+            verify_class: None,
+            ..Default::default()
+        };
+        assert!(targets.has_main_entry());
+    }
+
+    #[test]
+    fn decodes_unconditional_branch_target() {
+        let pc = 0x1000;
+        let inst = 0x1400_0004;
+        assert_eq!(branch_target(pc, inst), Some(0x1010));
+    }
+
+    #[test]
+    fn decodes_conditional_branch_target() {
+        let pc = 0x1000;
+        let inst = 0x5400_0042;
+        assert_eq!(branch_target(pc, inst), Some(0x1008));
+    }
+
+    #[test]
+    fn detects_android_14_and_15_clinit_loads() {
+        assert_eq!(ldr_w_from_reg(0xb940_0008, 0), Some(8));
+        assert_eq!(ldr_status_from_reg(0x3940_0109, 8), Some(9));
+        assert_eq!(ldr_status_from_reg(0xb940_0109, 8), Some(9));
+        assert_eq!(ldr_w_from_reg(0xb940_0010, 0), Some(16));
+        assert_eq!(ldr_status_from_reg(0xb940_6a11, 16), Some(17));
     }
 }

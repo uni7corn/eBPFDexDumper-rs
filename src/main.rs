@@ -20,7 +20,7 @@ enum Command {
     Dump(DumpArgs),
     /// Fix dumped DEX files in a directory.
     Fix(FixArgs),
-    /// Locate ART interpreter offsets in a libart.so ELF.
+    /// Locate ART interpreter hook targets in a libart.so ELF.
     Offsets(OffsetsArgs),
 }
 
@@ -67,11 +67,11 @@ struct DumpArgs {
     #[arg(long)]
     no_auto_fix: bool,
 
-    /// Manual offset for art::interpreter::Execute, decimal or 0x-prefixed hex.
+    /// Debug fallback for art::interpreter::Execute, decimal or 0x-prefixed hex.
     #[arg(long, value_parser = parse_u64)]
     execute_offset: Option<u64>,
 
-    /// Manual offset for ExecuteNterpImpl, decimal or 0x-prefixed hex.
+    /// Debug fallback for ExecuteNterpImpl, decimal or 0x-prefixed hex.
     #[arg(long, value_parser = parse_u64)]
     nterp_offset: Option<u64>,
 }
@@ -89,11 +89,11 @@ struct OffsetsArgs {
     #[arg(short, long)]
     libart: PathBuf,
 
-    /// Manual offset for art::interpreter::Execute, decimal or 0x-prefixed hex.
+    /// Debug fallback for art::interpreter::Execute, decimal or 0x-prefixed hex.
     #[arg(long, value_parser = parse_u64)]
     execute_offset: Option<u64>,
 
-    /// Manual offset for ExecuteNterpImpl, decimal or 0x-prefixed hex.
+    /// Debug fallback for ExecuteNterpImpl, decimal or 0x-prefixed hex.
     #[arg(long, value_parser = parse_u64)]
     nterp_offset: Option<u64>,
 }
@@ -108,12 +108,20 @@ fn main() -> Result<()> {
         }
         Some(Command::Fix(args)) => fix::fix_dex_directory(&args.dir),
         Some(Command::Offsets(args)) => {
-            let offsets =
+            let targets =
                 art::find_art_offsets(&args.libart, args.execute_offset, args.nterp_offset)
                     .with_context(|| format!("failed to parse {}", args.libart.display()))?;
-            println!("Execute: 0x{:x}", offsets.execute);
-            println!("ExecuteNterpImpl: 0x{:x}", offsets.execute_nterp);
-            println!("VerifyClass: 0x{:x}", offsets.verify_class);
+            print_target("Execute", targets.execute);
+            print_target("ExecuteNterpImpl", targets.execute_nterp);
+            print_target(
+                "ExecuteNterpWithClinitImpl",
+                targets.execute_nterp_with_clinit,
+            );
+            print_target("VerifyClass", targets.verify_class);
+            println!(
+                "nterp_op_invoke_*: {} target(s)",
+                targets.nterp_invoke_addrs.len()
+            );
             Ok(())
         }
         Some(Command::Dump(args)) => {
@@ -157,5 +165,12 @@ fn parse_u64(s: &str) -> Result<u64, String> {
         u64::from_str_radix(hex, 16).map_err(|err| err.to_string())
     } else {
         s.parse::<u64>().map_err(|err| err.to_string())
+    }
+}
+
+fn print_target(name: &str, target: Option<art::ResolvedTarget>) {
+    match target {
+        Some(target) => println!("{name}: 0x{:x} ({})", target.addr, target.source),
+        None => println!("{name}: not found"),
     }
 }

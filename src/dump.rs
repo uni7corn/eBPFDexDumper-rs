@@ -291,17 +291,24 @@ mod imp {
             format!("failed to create output directory {}", config.out.display())
         })?;
 
-        let offsets =
+        let targets =
             art::find_art_offsets(&config.libart, config.execute_offset, config.nterp_offset)
                 .with_context(|| {
                     format!(
-                        "failed to locate ART offsets in {}",
+                        "failed to locate ART hook targets in {}",
                         config.libart.display()
                     )
                 })?;
+        print_target("Execute", targets.execute);
+        print_target("ExecuteNterpImpl", targets.execute_nterp);
+        print_target(
+            "ExecuteNterpWithClinitImpl",
+            targets.execute_nterp_with_clinit,
+        );
+        print_target("VerifyClass", targets.verify_class);
         println!(
-            "[+] offsetExecute: {:x} offsetExecuteNterp: {:x} offsetVerifyClass: {:x}",
-            offsets.execute, offsets.execute_nterp, offsets.verify_class
+            "[+] nterp_op_invoke_* pattern targets: {}",
+            targets.nterp_invoke_addrs.len()
         );
 
         let asset_btf = load_asset_btf();
@@ -326,38 +333,53 @@ mod imp {
         )?;
         println!("[+] Filtering on uid {}", config.uid);
 
-        attach_uprobe(
-            &mut ebpf,
-            "uprobe_libart_execute",
-            &config.libart,
-            offsets.execute,
-        )
-        .context("failed to attach execute uprobe")?;
-        attach_uprobe(
-            &mut ebpf,
-            "uprobe_libart_executeNterpImpl",
-            &config.libart,
-            offsets.execute_nterp,
-        )
-        .context("failed to attach ExecuteNterpImpl uprobe")?;
+        let mut attached_main = 0usize;
+        if let Some(target) = targets.execute {
+            attach_uprobe(
+                &mut ebpf,
+                "uprobe_libart_execute",
+                &config.libart,
+                target.addr,
+            )
+            .context("failed to attach Execute uprobe")?;
+            attached_main += 1;
+        }
+        if let Some(target) = targets.execute_nterp {
+            attach_uprobe(
+                &mut ebpf,
+                "uprobe_libart_executeNterpImpl",
+                &config.libart,
+                target.addr,
+            )
+            .context("failed to attach ExecuteNterpImpl uprobe")?;
+            attached_main += 1;
+        }
+        if let Some(target) = targets.execute_nterp_with_clinit {
+            attach_uprobe(
+                &mut ebpf,
+                "uprobe_libart_executeNterpImpl",
+                &config.libart,
+                target.addr,
+            )
+            .context("failed to attach ExecuteNterpWithClinitImpl uprobe")?;
+            attached_main += 1;
+        }
+        if attached_main == 0 {
+            anyhow::bail!("no ART main entry uprobe was attached");
+        }
 
-        let invoke_pattern = [0x03, 0x0c, 0x40, 0xf9, 0x5f, 0x00, 0x03, 0xeb];
-        match read_file_for_patterns(&config.libart, &invoke_pattern) {
-            Ok(pattern_addrs) => {
-                println!(
-                    "[+] found nterp_op_invoke_* {} pattern",
-                    pattern_addrs.len()
+        for target in targets.nterp_invoke_addrs {
+            if let Err(err) = attach_uprobe(
+                &mut ebpf,
+                "uprobe_libart_nterpOpInvoke",
+                &config.libart,
+                target.addr,
+            ) {
+                eprintln!(
+                    "[-] failed to attach nterp_op_invoke_* at 0x{:x}: {err:#}",
+                    target.addr
                 );
-                for addr in pattern_addrs {
-                    attach_uprobe(
-                        &mut ebpf,
-                        "uprobe_libart_nterpOpInvoke",
-                        &config.libart,
-                        addr,
-                    )?;
-                }
             }
-            Err(err) => eprintln!("[-] pattern scan error: {err:#}"),
         }
 
         let state = Arc::new(DumpState::new(config.out.clone(), config.trace));
@@ -431,10 +453,11 @@ mod imp {
         }
     }
 
-    fn read_file_for_patterns(path: &std::path::Path, pattern: &[u8]) -> Result<Vec<u64>> {
-        let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-        let elf = goblin::elf::Elf::parse(&bytes).context("failed to parse ELF")?;
-        art::find_pattern_uaddrs(&elf, &bytes, pattern)
+    fn print_target(name: &str, target: Option<art::ResolvedTarget>) {
+        match target {
+            Some(target) => println!("[+] {name}: 0x{:x} ({})", target.addr, target.source),
+            None => println!("[-] {name}: not found"),
+        }
     }
 
     fn load_asset_btf() -> Option<Btf> {
@@ -635,21 +658,35 @@ mod imp {
         fs::create_dir_all(&config.out).with_context(|| {
             format!("failed to create output directory {}", config.out.display())
         })?;
-        let offsets =
+        let targets =
             art::find_art_offsets(&config.libart, config.execute_offset, config.nterp_offset)
                 .with_context(|| {
                     format!(
-                        "failed to locate ART offsets in {}",
+                        "failed to locate ART hook targets in {}",
                         config.libart.display()
                     )
                 })?;
+        print_target("Execute", targets.execute);
+        print_target("ExecuteNterpImpl", targets.execute_nterp);
+        print_target(
+            "ExecuteNterpWithClinitImpl",
+            targets.execute_nterp_with_clinit,
+        );
+        print_target("VerifyClass", targets.verify_class);
         println!(
-            "[+] offsetExecute: {:x} offsetExecuteNterp: {:x} offsetVerifyClass: {:x}",
-            offsets.execute, offsets.execute_nterp, offsets.verify_class
+            "[+] nterp_op_invoke_* pattern targets: {}",
+            targets.nterp_invoke_addrs.len()
         );
         println!("[+] Filtering on uid {}", config.uid);
         let _ = (config.package_name, config.trace, config.auto_fix);
         anyhow::bail!("live dump is available only when built for Linux/Android")
+    }
+
+    fn print_target(name: &str, target: Option<art::ResolvedTarget>) {
+        match target {
+            Some(target) => println!("[+] {name}: 0x{:x} ({})", target.addr, target.source),
+            None => println!("[-] {name}: not found"),
+        }
     }
 }
 
