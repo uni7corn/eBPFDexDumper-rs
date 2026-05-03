@@ -14,8 +14,9 @@ ARM64 `vmlinux.h` 和最小 BTF 资源。
 - 分块重建 DEX，并在 eBPF 分块读取失败时自动使用 `process_vm_readv` 兜底。
 - 导出方法字节码 JSON，用于后续 DEX 修复。
 - 支持 `fix` 命令，将记录到的方法字节码回填到 DEX，并输出到 `fix/` 目录。
-- 支持从 `libart.so` 中自动定位 ART `Execute`、`ExecuteNterpImpl` 和
-  `VerifyClass` 偏移。
+- 支持从 `libart.so` 中自动定位 ART `Execute`、`ExecuteNterpImpl`、
+  `ExecuteNterpWithClinitImpl` 和 `VerifyClass` hook 目标。
+- ART 运行时对象字段通过 layout 下发给 eBPF，并带有 DEX magic 校验和有限候选扫描兜底。
 - 支持 GitHub Actions CI 和 Android ARM64 Release 打包。
 
 ## 环境要求
@@ -104,6 +105,14 @@ su -c './eBPFDexDumper dump -n com.example.app --no-clean-oat --no-auto-fix'
 
 ```bash
 ./eBPFDexDumper offsets -l /apex/com.android.art/lib64/libart.so
+```
+
+如需调试厂商 ROM 的 ART 字段布局，可以手动覆盖 layout。参数顺序为：
+`ShadowFrame.method,ArtMethod.declaring_class,ArtMethod.dex_method_index,ArtMethod.data,Class.dex_cache,DexCache.dex_file,DexFile.begin,DexHeader.file_size,CodeItem.insns_size,CodeItem.insns`。
+
+```bash
+./eBPFDexDumper offsets -l /apex/com.android.art/lib64/libart.so \
+  --art-layout 0x8,0x0,0x8,0x10,0x10,0x10,0x8,0x20,0xc,0x10
 ```
 
 ## 常见日志

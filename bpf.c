@@ -3,6 +3,7 @@
 #include "vmlinux.h"
 
 const struct config_t *unused_config_t __attribute__((unused));
+const struct art_layout_t *unused_art_layout_t __attribute__((unused));
 const struct dex_event_data_t *unused_dex_event_data_t __attribute__((unused));
 const struct method_event_data_t *unused_method_event_data_t __attribute__((unused));
 const buf_t *unused_buf_t __attribute__((unused));
@@ -13,6 +14,21 @@ static int config_loaded = 0;
 static bool filter_enable = false;
 static uid_t targ_uid = INVALID_UID_PID;
 static pid_t targ_pid = INVALID_UID_PID;
+static struct art_layout_t cached_art_layout = {};
+static bool art_layout_loaded = false;
+
+#define DEFAULT_SHADOW_FRAME_METHOD_OFFSET 0x08
+#define DEFAULT_ART_METHOD_DECLARING_CLASS_OFFSET 0x00
+#define DEFAULT_ART_METHOD_DEX_METHOD_INDEX_OFFSET 0x08
+#define DEFAULT_ART_METHOD_DATA_OFFSET 0x10
+#define DEFAULT_CLASS_DEX_CACHE_OFFSET 0x10
+#define DEFAULT_DEX_CACHE_DEX_FILE_OFFSET 0x10
+#define DEFAULT_DEX_FILE_BEGIN_OFFSET 0x08
+#define DEFAULT_DEX_HEADER_FILE_SIZE_OFFSET 0x20
+#define DEFAULT_CODE_ITEM_INSNS_SIZE_OFFSET 0x0c
+#define DEFAULT_CODE_ITEM_INSNS_OFFSET 0x10
+#define DEX_MAGIC 0x0a786564
+#define MAX_DEX_FILE_SIZE 0x40000000
 
 static __always_inline bool valid_uid(uid_t uid) {
 	return uid != INVALID_UID_PID;
@@ -29,6 +45,132 @@ static __always_inline void* untag(void* ptr)
     return tmp;
 }
 
+static __always_inline struct art_layout_t *get_art_layout(void)
+{
+    if (!art_layout_loaded) {
+        u32 zero = 0;
+        struct art_layout_t *layout = (struct art_layout_t *)bpf_map_lookup_elem(&art_layout_map, &zero);
+        if (layout) {
+            cached_art_layout = *layout;
+        } else {
+            cached_art_layout.shadow_frame_method_offset = DEFAULT_SHADOW_FRAME_METHOD_OFFSET;
+            cached_art_layout.art_method_declaring_class_offset = DEFAULT_ART_METHOD_DECLARING_CLASS_OFFSET;
+            cached_art_layout.art_method_dex_method_index_offset = DEFAULT_ART_METHOD_DEX_METHOD_INDEX_OFFSET;
+            cached_art_layout.art_method_data_offset = DEFAULT_ART_METHOD_DATA_OFFSET;
+            cached_art_layout.class_dex_cache_offset = DEFAULT_CLASS_DEX_CACHE_OFFSET;
+            cached_art_layout.dex_cache_dex_file_offset = DEFAULT_DEX_CACHE_DEX_FILE_OFFSET;
+            cached_art_layout.dex_file_begin_offset = DEFAULT_DEX_FILE_BEGIN_OFFSET;
+            cached_art_layout.dex_header_file_size_offset = DEFAULT_DEX_HEADER_FILE_SIZE_OFFSET;
+            cached_art_layout.code_item_insns_size_offset = DEFAULT_CODE_ITEM_INSNS_SIZE_OFFSET;
+            cached_art_layout.code_item_insns_offset = DEFAULT_CODE_ITEM_INSNS_OFFSET;
+        }
+        art_layout_loaded = true;
+    }
+    return &cached_art_layout;
+}
+
+static __always_inline int read_dex_from_art_method(
+    u64 art_method_ptr,
+    u32 art_method_declaring_class_offset,
+    u32 class_dex_cache_offset,
+    u32 dex_cache_dex_file_offset,
+    u32 dex_file_begin_offset,
+    u32 dex_header_file_size_offset,
+    u64 *begin,
+    u32 *size)
+{
+    *begin = 0;
+    *size = 0;
+
+    unsigned char *declaring_class_ptr = 0;
+    bpf_probe_read_user(
+        &declaring_class_ptr,
+        sizeof(u32),
+        (void *)(art_method_ptr + art_method_declaring_class_offset));
+    if (!declaring_class_ptr) {
+        return 0;
+    }
+
+    unsigned char *dex_cache_ptr = 0;
+    bpf_probe_read_user(
+        &dex_cache_ptr,
+        sizeof(u64),
+        declaring_class_ptr + class_dex_cache_offset);
+    if (!dex_cache_ptr) {
+        return 0;
+    }
+
+    unsigned char *dex_file_ptr = 0;
+    bpf_probe_read_user(
+        &dex_file_ptr,
+        sizeof(u64),
+        dex_cache_ptr + dex_cache_dex_file_offset);
+    dex_file_ptr = (unsigned char *)untag(dex_file_ptr);
+    if (!dex_file_ptr) {
+        return 0;
+    }
+
+    bpf_probe_read_user(begin, sizeof(u64), dex_file_ptr + dex_file_begin_offset);
+    bpf_probe_read_user(
+        size,
+        sizeof(u32),
+        (void *)((unsigned long)untag((void *)*begin) + dex_header_file_size_offset));
+    if (*begin == 0 || *size == 0 || *size > MAX_DEX_FILE_SIZE) {
+        return 0;
+    }
+
+    u32 magic = 0;
+    bpf_probe_read_user(&magic, sizeof(u32), (void *)untag((void *)*begin));
+    return magic == DEX_MAGIC;
+}
+
+static __always_inline int resolve_dex_from_art_method(
+    u64 art_method_ptr,
+    struct art_layout_t *layout,
+    u64 *begin,
+    u32 *size,
+    u32 *dex_method_index)
+{
+    *dex_method_index = 0;
+    bpf_probe_read_user(
+        dex_method_index,
+        sizeof(u32),
+        (void *)(art_method_ptr + layout->art_method_dex_method_index_offset));
+
+    if (read_dex_from_art_method(
+            art_method_ptr,
+            layout->art_method_declaring_class_offset,
+            layout->class_dex_cache_offset,
+            layout->dex_cache_dex_file_offset,
+            layout->dex_file_begin_offset,
+            layout->dex_header_file_size_offset,
+            begin,
+            size)) {
+        return 1;
+    }
+
+#pragma unroll
+    for (int class_slot = 0; class_slot < 4; class_slot++) {
+        u32 class_dex_cache_offset = 0x10 + class_slot * 8;
+#pragma unroll
+        for (int dex_cache_slot = 0; dex_cache_slot < 4; dex_cache_slot++) {
+            u32 dex_cache_dex_file_offset = 0x10 + dex_cache_slot * 8;
+            if (read_dex_from_art_method(
+                    art_method_ptr,
+                    layout->art_method_declaring_class_offset,
+                    class_dex_cache_offset,
+                    dex_cache_dex_file_offset,
+                    layout->dex_file_begin_offset,
+                    layout->dex_header_file_size_offset,
+                    begin,
+                    size)) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static __always_inline 
 u32 read_method_bytecode(u64 art_method_ptr, u32 *codeitem_size) {
     *codeitem_size = 0;
@@ -40,8 +182,9 @@ u32 read_method_bytecode(u64 art_method_ptr, u32 *codeitem_size) {
     }
     
     // Get the CodeItem pointer from ArtMethod
+    struct art_layout_t *layout = get_art_layout();
     u64 code_item_ptr = 0;
-    if (bpf_probe_read_user(&code_item_ptr, sizeof(u64), (void *)(art_method_ptr + 0x10)) != 0) {
+    if (bpf_probe_read_user(&code_item_ptr, sizeof(u64), (void *)(art_method_ptr + layout->art_method_data_offset)) != 0) {
         return 0;
     }
     
@@ -53,7 +196,7 @@ u32 read_method_bytecode(u64 art_method_ptr, u32 *codeitem_size) {
     
     // Read CodeItem header to get insns_size_in_code_units
     u32 insns_size = 0;
-    if (bpf_probe_read_user(&insns_size, sizeof(u32), (void *)(code_item_ptr + 0x0c)) != 0) {
+    if (bpf_probe_read_user(&insns_size, sizeof(u32), (void *)(code_item_ptr + layout->code_item_insns_size_offset)) != 0) {
         return 0;
     }
     
@@ -83,7 +226,7 @@ u32 read_method_bytecode(u64 art_method_ptr, u32 *codeitem_size) {
     : [size] "r"(bytes_to_read), [max] "i"(MAX_PERCPU_BUFSIZE - sizeof(struct method_event_data_t)));
 
     if (bpf_probe_read_user(buf->buf + sizeof(struct method_event_data_t), bytes_to_read, 
-                            (void *)(code_item_ptr + 0x10)) != 0) {
+	                            (void *)(code_item_ptr + layout->code_item_insns_offset)) != 0) {
         *codeitem_size = 0;
         return 0;
     }
@@ -254,32 +397,21 @@ int uprobe_libart_execute(struct pt_regs *ctx)
         return 0;
     }
 
-    struct dex_event_data_t evt = {};
-    __builtin_memset(&evt, 0, sizeof(evt)); 
+    struct art_layout_t *layout = get_art_layout();
     unsigned char *shadow_frame_ptr = (unsigned char *)PT_REGS_PARM3(ctx);
 
     u64 art_method_ptr = 0;
-    bpf_probe_read_user(&art_method_ptr, sizeof(u64), shadow_frame_ptr + 8);
+    bpf_probe_read_user(
+        &art_method_ptr,
+        sizeof(u64),
+        shadow_frame_ptr + layout->shadow_frame_method_offset);
     if (filter_art(art_method_ptr)) return 0;
 
     u32 dex_method_index = 0;
-    bpf_probe_read_user(&dex_method_index, sizeof(u32), (void *)(art_method_ptr + 0x08));
-
-    unsigned char *declaring_class_ptr = 0;
-    bpf_probe_read_user(&declaring_class_ptr, sizeof(u32), (void *)art_method_ptr);
-
-    unsigned char *dex_cache_ptr = 0;
-    bpf_probe_read_user(&dex_cache_ptr, sizeof(u64), declaring_class_ptr + 0x10);
-
-    unsigned char *dex_file_ptr = 0;
-    bpf_probe_read_user(&dex_file_ptr, sizeof(u64), dex_cache_ptr + 0x10);
-    dex_file_ptr = (unsigned char *)untag(dex_file_ptr);
-    
     u64 begin = 0;
     u32 size = 0;
     u8 ch = 0;
-    bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
-    bpf_probe_read_user(&size, sizeof(u32), (void *)((unsigned long)untag((void *)begin) + 0x20));
+    resolve_dex_from_art_method(art_method_ptr, layout, &begin, &size, &dex_method_index);
 
     // read one byte to check if readable
     bpf_probe_read_user(&ch, sizeof(u8), (void *)begin);
@@ -326,24 +458,12 @@ int uprobe_libart_executeNterpImpl(struct pt_regs *ctx)
     u64 art_method_ptr = (u64)PT_REGS_PARM1(ctx);
     if (filter_art(art_method_ptr)) return 0;
 
+    struct art_layout_t *layout = get_art_layout();
     u32 dex_method_index = 0;
-    bpf_probe_read_user(&dex_method_index, sizeof(u32), (void *)(art_method_ptr + 0x08));
-
-    unsigned char *declaring_class_ptr = 0;
-    bpf_probe_read_user(&declaring_class_ptr, sizeof(u32), (void *)art_method_ptr);
-    
-    unsigned char *dex_cache_ptr = 0;
-    bpf_probe_read_user(&dex_cache_ptr, sizeof(u64), declaring_class_ptr + 0x10);
-
-    unsigned char *dex_file_ptr = 0;
-    bpf_probe_read_user(&dex_file_ptr, sizeof(u64), dex_cache_ptr + 0x10);
-    dex_file_ptr = (unsigned char *)untag(dex_file_ptr);
-
     u64 begin = 0;
     u32 size = 0;
     u8 ch = 0;
-    bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
-    bpf_probe_read_user(&size, sizeof(u32), (void *)((unsigned long)untag((void *)begin) + 0x20));
+    resolve_dex_from_art_method(art_method_ptr, layout, &begin, &size, &dex_method_index);
 
     // read one byte to check if readable
     bpf_probe_read_user(&ch, sizeof(u8), (void *)begin);
@@ -390,24 +510,12 @@ int uprobe_libart_nterpOpInvoke(struct pt_regs *ctx)
     u64 art_method_ptr = (u64)PT_REGS_PARM1(ctx);
     if (filter_art(art_method_ptr)) return 0;
 
+    struct art_layout_t *layout = get_art_layout();
     u32 dex_method_index = 0;
-    bpf_probe_read_user(&dex_method_index, sizeof(u32), (void *)(art_method_ptr + 0x08));
-
-    unsigned char *declaring_class_ptr = 0;
-    bpf_probe_read_user(&declaring_class_ptr, sizeof(u32), (void *)art_method_ptr);
-    
-    unsigned char *dex_cache_ptr = 0;
-    bpf_probe_read_user(&dex_cache_ptr, sizeof(u64), declaring_class_ptr + 0x10);
-
-    unsigned char *dex_file_ptr = 0;
-    bpf_probe_read_user(&dex_file_ptr, sizeof(u64), dex_cache_ptr + 0x10);
-    dex_file_ptr = (unsigned char *)untag(dex_file_ptr);
-    
     u64 begin = 0;
     u32 size = 0;
     u8 ch = 0;
-    bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
-    bpf_probe_read_user(&size, sizeof(u32), (void *)((unsigned long)untag((void *)begin) + 0x20));
+    resolve_dex_from_art_method(art_method_ptr, layout, &begin, &size, &dex_method_index);
     // read one byte to check if readable
     bpf_probe_read_user(&ch, sizeof(u8), (void *)begin);
 
@@ -454,12 +562,16 @@ int uprobe_libart_verifyClass(struct pt_regs *ctx)
     __builtin_memset(&evt, 0, sizeof(evt)); 
     unsigned char *dex_file_ptr = (unsigned char *)PT_REGS_PARM3(ctx);
     dex_file_ptr = (unsigned char *)untag(dex_file_ptr);
+    struct art_layout_t *layout = get_art_layout();
     
     u64 begin = 0;
     u32 size = 0;
     u8 ch = 0;
-    bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
-    bpf_probe_read_user(&size, sizeof(u32), (void *)((unsigned long)untag((void *)begin) + 0x20));
+    bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + layout->dex_file_begin_offset);
+    bpf_probe_read_user(
+        &size,
+        sizeof(u32),
+        (void *)((unsigned long)untag((void *)begin) + layout->dex_header_file_size_offset));
 
     if(begin != 0 && size != 0) {
         if (size < 0){

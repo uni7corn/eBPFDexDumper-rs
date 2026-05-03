@@ -16,6 +16,19 @@ struct config_t{
 	pid_t pid;
 };
 
+struct art_layout_t {
+    u32 shadow_frame_method_offset;
+    u32 art_method_declaring_class_offset;
+    u32 art_method_dex_method_index_offset;
+    u32 art_method_data_offset;
+    u32 class_dex_cache_offset;
+    u32 dex_cache_dex_file_offset;
+    u32 dex_file_begin_offset;
+    u32 dex_header_file_size_offset;
+    u32 code_item_insns_size_offset;
+    u32 code_item_insns_offset;
+};
+
 struct dex_event_data_t {
     u64 begin;
     u32 pid;
@@ -90,6 +103,15 @@ struct
     __type(key, u32);
     __type(value, struct config_t);
 } config_map SEC(".maps");
+
+// ART runtime layout map. User space resolves the offsets and writes one entry.
+struct
+{
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct art_layout_t);
+} art_layout_map SEC(".maps");
 
 // dexFileCache map
 struct

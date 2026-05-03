@@ -74,6 +74,10 @@ struct DumpArgs {
     /// Debug fallback for ExecuteNterpImpl, decimal or 0x-prefixed hex.
     #[arg(long, value_parser = parse_u64)]
     nterp_offset: Option<u64>,
+
+    /// Override ART runtime layout offsets as ten comma-separated integers.
+    #[arg(long, value_parser = parse_art_layout)]
+    art_layout: Option<art::ArtRuntimeLayout>,
 }
 
 #[derive(Debug, Parser)]
@@ -96,6 +100,10 @@ struct OffsetsArgs {
     /// Debug fallback for ExecuteNterpImpl, decimal or 0x-prefixed hex.
     #[arg(long, value_parser = parse_u64)]
     nterp_offset: Option<u64>,
+
+    /// Override ART runtime layout offsets as ten comma-separated integers.
+    #[arg(long, value_parser = parse_art_layout)]
+    art_layout: Option<art::ArtRuntimeLayout>,
 }
 
 fn main() -> Result<()> {
@@ -122,6 +130,13 @@ fn main() -> Result<()> {
                 "nterp_op_invoke_*: {} target(s)",
                 targets.nterp_invoke_addrs.len()
             );
+            let runtime_layout = match args.art_layout {
+                Some(layout) => layout,
+                None => art::resolve_runtime_layout(&args.libart).with_context(|| {
+                    format!("failed to resolve ART layout for {}", args.libart.display())
+                })?,
+            };
+            println!("ART runtime layout: {}", runtime_layout.summary());
             Ok(())
         }
         Some(Command::Dump(args)) => {
@@ -154,6 +169,7 @@ fn main() -> Result<()> {
                 auto_fix,
                 execute_offset: args.execute_offset,
                 nterp_offset: args.nterp_offset,
+                runtime_layout: args.art_layout,
             };
             dump::run(config)
         }
@@ -166,6 +182,49 @@ fn parse_u64(s: &str) -> Result<u64, String> {
     } else {
         s.parse::<u64>().map_err(|err| err.to_string())
     }
+}
+
+fn parse_u32(s: &str) -> Result<u32, String> {
+    let value = parse_u64(s)?;
+    u32::try_from(value).map_err(|_| format!("{s} is larger than u32"))
+}
+
+fn parse_art_layout(s: &str) -> Result<art::ArtRuntimeLayout, String> {
+    let parts = s
+        .split(',')
+        .map(str::trim)
+        .map(parse_u32)
+        .collect::<Result<Vec<_>, _>>()?;
+    let [
+        shadow_frame_method_offset,
+        art_method_declaring_class_offset,
+        art_method_dex_method_index_offset,
+        art_method_data_offset,
+        class_dex_cache_offset,
+        dex_cache_dex_file_offset,
+        dex_file_begin_offset,
+        dex_header_file_size_offset,
+        code_item_insns_size_offset,
+        code_item_insns_offset,
+    ]: [u32; 10] = parts.try_into().map_err(|parts: Vec<u32>| {
+        format!(
+            "expected 10 comma-separated offsets, got {}",
+            parts.len()
+        )
+    })?;
+
+    Ok(art::ArtRuntimeLayout {
+        shadow_frame_method_offset,
+        art_method_declaring_class_offset,
+        art_method_dex_method_index_offset,
+        art_method_data_offset,
+        class_dex_cache_offset,
+        dex_cache_dex_file_offset,
+        dex_file_begin_offset,
+        dex_header_file_size_offset,
+        code_item_insns_size_offset,
+        code_item_insns_offset,
+    })
 }
 
 fn print_target(name: &str, target: Option<art::ResolvedTarget>) {

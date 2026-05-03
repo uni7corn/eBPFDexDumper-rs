@@ -4,6 +4,54 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArtRuntimeLayout {
+    pub shadow_frame_method_offset: u32,
+    pub art_method_declaring_class_offset: u32,
+    pub art_method_dex_method_index_offset: u32,
+    pub art_method_data_offset: u32,
+    pub class_dex_cache_offset: u32,
+    pub dex_cache_dex_file_offset: u32,
+    pub dex_file_begin_offset: u32,
+    pub dex_header_file_size_offset: u32,
+    pub code_item_insns_size_offset: u32,
+    pub code_item_insns_offset: u32,
+}
+
+impl ArtRuntimeLayout {
+    pub const fn android_13_plus_default() -> Self {
+        Self {
+            shadow_frame_method_offset: 0x08,
+            art_method_declaring_class_offset: 0x00,
+            art_method_dex_method_index_offset: 0x08,
+            art_method_data_offset: 0x10,
+            class_dex_cache_offset: 0x10,
+            dex_cache_dex_file_offset: 0x10,
+            dex_file_begin_offset: 0x08,
+            dex_header_file_size_offset: 0x20,
+            code_item_insns_size_offset: 0x0c,
+            code_item_insns_offset: 0x10,
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "ShadowFrame.method=0x{:x}, ArtMethod.declaring_class=0x{:x}, ArtMethod.dex_method_index=0x{:x}, ArtMethod.data=0x{:x}, Class.dex_cache=0x{:x}, DexCache.dex_file=0x{:x}, DexFile.begin=0x{:x}, DexHeader.file_size=0x{:x}, CodeItem.insns_size=0x{:x}, CodeItem.insns=0x{:x}",
+            self.shadow_frame_method_offset,
+            self.art_method_declaring_class_offset,
+            self.art_method_dex_method_index_offset,
+            self.art_method_data_offset,
+            self.class_dex_cache_offset,
+            self.dex_cache_dex_file_offset,
+            self.dex_file_begin_offset,
+            self.dex_header_file_size_offset,
+            self.code_item_insns_size_offset,
+            self.code_item_insns_offset
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetSource {
     Manual,
@@ -195,6 +243,13 @@ pub fn find_art_offsets(
     }
 
     Ok(targets)
+}
+
+pub fn resolve_runtime_layout(_libart_path: &Path) -> Result<ArtRuntimeLayout> {
+    // Android 13+ currently uses this compact 64-bit ART layout for the fields
+    // the dumper needs. Keeping it behind a resolver lets later versions swap
+    // in source-derived or live-probed layouts without touching the BPF program.
+    Ok(ArtRuntimeLayout::android_13_plus_default())
 }
 
 pub fn parse_libart_symbols(elf: &Elf<'_>) -> HashMap<String, u64> {

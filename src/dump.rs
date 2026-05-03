@@ -10,6 +10,7 @@ pub struct DumpConfig {
     pub auto_fix: bool,
     pub execute_offset: Option<u64>,
     pub nterp_offset: Option<u64>,
+    pub runtime_layout: Option<crate::art::ArtRuntimeLayout>,
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -17,7 +18,7 @@ mod imp {
     use super::DumpConfig;
     use crate::{art, dex::DexParser, fix};
     use anyhow::{Context, Result};
-    use aya::maps::{HashMap as AyaHashMap, MapData, RingBuf};
+    use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, MapData, RingBuf};
     use aya::programs::{ProgramError, UProbe};
     use aya::{include_bytes_aligned, Btf, EbpfLoader, Pod};
     use object::Endianness;
@@ -45,6 +46,8 @@ mod imp {
     }
 
     unsafe impl Pod for BpfConfig {}
+
+    unsafe impl Pod for art::ArtRuntimeLayout {}
 
     #[derive(Clone, Debug, Serialize)]
     struct MethodCodeRecord {
@@ -310,6 +313,16 @@ mod imp {
             "[+] nterp_op_invoke_* pattern targets: {}",
             targets.nterp_invoke_addrs.len()
         );
+        let runtime_layout = match config.runtime_layout {
+            Some(layout) => layout,
+            None => art::resolve_runtime_layout(&config.libart).with_context(|| {
+                format!(
+                    "failed to resolve ART layout for {}",
+                    config.libart.display()
+                )
+            })?,
+        };
+        println!("[+] ART runtime layout: {}", runtime_layout.summary());
 
         let asset_btf = load_asset_btf();
         let mut loader = EbpfLoader::new();
@@ -331,6 +344,11 @@ mod imp {
             },
             0,
         )?;
+        let mut layout_map: AyaArray<&mut MapData, art::ArtRuntimeLayout> = AyaArray::try_from(
+            ebpf.map_mut("art_layout_map")
+                .context("art_layout_map not found")?,
+        )?;
+        layout_map.set(0, runtime_layout, 0)?;
         println!("[+] Filtering on uid {}", config.uid);
 
         let mut attached_main = 0usize;
@@ -677,6 +695,16 @@ mod imp {
             "[+] nterp_op_invoke_* pattern targets: {}",
             targets.nterp_invoke_addrs.len()
         );
+        let runtime_layout = match config.runtime_layout {
+            Some(layout) => layout,
+            None => art::resolve_runtime_layout(&config.libart).with_context(|| {
+                format!(
+                    "failed to resolve ART layout for {}",
+                    config.libart.display()
+                )
+            })?,
+        };
+        println!("[+] ART runtime layout: {}", runtime_layout.summary());
         println!("[+] Filtering on uid {}", config.uid);
         let _ = (config.package_name, config.trace, config.auto_fix);
         anyhow::bail!("live dump is available only when built for Linux/Android")
