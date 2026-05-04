@@ -94,3 +94,7 @@ packer-specific hooks are still required.
 `headers/LICENSE.BSD-2-Clause`.
 
 Use this project only on devices, apps, and data you are authorized to analyze.
+
+## Reference
+
+This project references part of the implementation logic from [LLeavesG/eBPFDexDumper](https://github.com/LLeavesG/eBPFDexDumper).

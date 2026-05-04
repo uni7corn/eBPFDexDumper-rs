@@ -91,3 +91,7 @@ ShadowFrame.method,ArtMethod.declaring_class,ArtMethod.dex_method_index,ArtMetho
 `headers/LICENSE.BSD-2-Clause`。
 
 请只在你有权分析的设备、应用和数据上使用本项目。
+
+## 参考
+
+本项目参考了 [LLeavesG/eBPFDexDumper](https://github.com/LLeavesG/eBPFDexDumper) 的部分实现逻辑。

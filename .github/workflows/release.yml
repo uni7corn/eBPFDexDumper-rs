@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Release tag, for example v0.1.0"
-        required: true
-        type: string
 
 permissions:
   contents: write
@@ -22,7 +16,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ github.ref }}
 
       - name: Install LLVM clang
         run: sudo apt-get update && sudo apt-get install -y clang llvm
@@ -51,7 +45,7 @@ jobs:
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ github.ref_name }}
           files: |
             dist/eBPFDexDumper_android_arm64
             dist/eBPFDexDumper_android_arm64.sha256
