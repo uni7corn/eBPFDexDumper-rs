@@ -5,14 +5,14 @@ use std::process::{Command, Stdio};
 fn main() {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let bpf_source = manifest_dir.join("bpf.c");
+    let bpf_source = manifest_dir.join("bpf/bpf.c");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let object = out_dir.join("bpf_arm64_bpfel.o");
 
     println!("cargo:rerun-if-changed={}", bpf_source.display());
     println!(
         "cargo:rerun-if-changed={}",
-        manifest_dir.join("header.h").display()
+        manifest_dir.join("bpf/header.h").display()
     );
     println!("cargo:rerun-if-env-changed=CLANG");
     rerun_dir(&manifest_dir.join("headers"));
@@ -30,6 +30,8 @@ fn main() {
         .arg(&bpf_source)
         .arg("-o")
         .arg(&object)
+        .arg("-I")
+        .arg(manifest_dir.join("bpf"))
         .arg("-I")
         .arg(manifest_dir.join("headers"))
         .arg("-I")
