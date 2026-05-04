@@ -6,9 +6,7 @@
 
 [中文](../README.md) | English
 
-An eBPF DEX dumper for rooted Android 13-17 ARM64 devices. It captures DEX data
-from ART with eBPF/uProbe, records executed method bytecode, and can write the
-recorded bytecode back into dumped DEX files.
+An eBPF DEX dumper for rooted Android 13-17 ARM64 devices. It captures DEX data from ART with eBPF/uProbe, records executed method bytecode, and can write the recorded bytecode back into dumped DEX files.
 
 ## Features
 
@@ -83,15 +81,11 @@ Outputs under `dist/`:
 
 ## Notes
 
-The default ART layout targets common Android 13+ layouts. Use `--art-layout`
-when a ROM uses different offsets. If a target only decrypts fragmented method
-bodies briefly in native code and never keeps a continuous valid DEX in memory,
-packer-specific hooks are still required.
+The default ART layout targets common Android 13+ layouts. Use `--art-layout` when a ROM uses different offsets. If a target only decrypts fragmented method bodies briefly in native code and never keeps a continuous valid DEX in memory, packer-specific hooks are still required.
 
 ## License
 
-`GPL-3.0-or-later`. The Linux BPF helper headers carry a BSD-2-Clause license at
-`headers/LICENSE.BSD-2-Clause`.
+`GPL-3.0-or-later`. The Linux BPF helper headers carry a BSD-2-Clause license at `headers/LICENSE.BSD-2-Clause`.
 
 Use this project only on devices, apps, and data you are authorized to analyze.
 
