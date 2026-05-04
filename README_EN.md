@@ -6,9 +6,9 @@
 
 [中文](README.md) | English
 
-An eBPF DEX dumper for rooted Android ARM64 devices. It captures DEX data from ART
-with eBPF/uProbe, records executed method bytecode, and can write the recorded
-bytecode back into dumped DEX files.
+An eBPF DEX dumper for rooted Android 13-17 ARM64 devices. It captures DEX data
+from ART with eBPF/uProbe, records executed method bytecode, and can write the
+recorded bytecode back into dumped DEX files.
 
 ## Features
 

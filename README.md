@@ -6,8 +6,8 @@
 
 中文 | [English](README_EN.md)
 
-面向 Android ARM64 的 eBPF DEX dump 工具。用于在已 root 设备上通过 eBPF/uProbe 捕获
-ART 运行时中的 DEX，记录执行过的方法字节码，并可将字节码回填到已 dump 的 DEX。
+面向 Android 13-17 ARM64 的 eBPF DEX dump 工具。用于在已 root 设备上通过 eBPF/uProbe
+捕获 ART 运行时中的 DEX，记录执行过的方法字节码，并可将字节码回填到已 dump 的 DEX。
 
 ## 功能
 
