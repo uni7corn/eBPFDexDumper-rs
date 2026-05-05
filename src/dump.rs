@@ -60,7 +60,7 @@ mod imp {
     static RUNNING: AtomicBool = AtomicBool::new(false);
 
     fn keep_running() -> bool {
-        RUNNING.load(Ordering::Relaxed)
+        RUNNING.load(Ordering::Acquire)
     }
 
     #[repr(C)]

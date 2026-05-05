@@ -54,8 +54,11 @@ static __always_inline bool valid_uid(uid_t uid) {
 	return uid != INVALID_UID_PID;
 }
 
-static __always_inline bool filter_art(u64 artmethod) {
-    // check if high 32 bits are zero
+// Returns true when artmethod is a compressed heap reference (only the
+// lower 32 bits are populated). Compressed refs happen when ART is built
+// with 32-bit HeapReference<Class>; dereferencing them directly would
+// fault, so the caller must skip them.
+static __always_inline bool is_compressed_ref(u64 artmethod) {
     return (artmethod & 0xFFFFFFFF00000000) == 0;
 }
 
@@ -134,10 +137,13 @@ static __always_inline int looks_like_dex_header(u64 addr, u32 dex_header_file_s
     if (magic != DEX_MAGIC) {
         return 0;
     }
-    bpf_probe_read_user(
-        size,
-        sizeof(u32),
-        (void *)((unsigned long)untag((void *)addr) + dex_header_file_size_offset));
+    if (bpf_probe_read_user(
+            size,
+            sizeof(u32),
+            (void *)((unsigned long)untag((void *)addr) + dex_header_file_size_offset)) != 0) {
+        *size = 0;
+        return 0;
+    }
     return *size >= NATIVE_MIN_COPY_SIZE && *size <= MAX_DEX_FILE_SIZE;
 }
 
@@ -512,7 +518,7 @@ static __always_inline void submit_dex_chunks_partial(u64 begin, u32 pid, u32 si
 
 static __always_inline int handle_art_method(struct config_t *conf, u32 pid, u64 art_method_ptr)
 {
-    if (filter_art(art_method_ptr)) {
+    if (is_compressed_ref(art_method_ptr)) {
         return 0;
     }
 
@@ -800,12 +806,9 @@ int uprobe_libc_mprotect(struct pt_regs *ctx)
     return 0;
 }
 
-SEC("uretprobe/libc_memfd_create")
-int uretprobe_libc_memfd_create(struct pt_regs *ctx)
-{
-    (void)ctx;
-    return 0;
-}
+// uretprobe_libc_memfd_create stub removed — the original empty body was
+// dead code. If memfd_create coverage is needed later, re-add a real probe
+// that calls submit_native_buffer_event like the mmap uretprobe.
 
 // ClassLinker::RegisterDexFile(ClassLinker* this, DexFile const& dex,
 //                              ObjPtr<ClassLoader> loader). On AArch64 C++ ABI
