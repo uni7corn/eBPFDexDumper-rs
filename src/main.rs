@@ -101,6 +101,10 @@ struct DumpArgs {
     #[arg(long)]
     no_native_buffer_scan: bool,
 
+    /// Experimental: dump anonymous executable ARM64 ELF candidates from native loader behavior.
+    #[arg(long)]
+    native_elf_scan: bool,
+
     /// Probe set to attach: full, lifecycle, or maps-only.
     #[arg(long, value_enum, default_value_t = ProbeModeArg::Full)]
     probe_mode: ProbeModeArg,
@@ -277,6 +281,7 @@ fn main() -> Result<()> {
                 code_item_fallback: !args.no_code_item_fallback,
                 maps_scan: !args.no_maps_scan,
                 native_buffer_scan: !args.no_native_buffer_scan,
+                native_elf_scan: args.native_elf_scan,
                 probe_mode: args.probe_mode.into(),
                 libc: args.libc,
             };

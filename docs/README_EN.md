@@ -46,6 +46,7 @@ target/aarch64-linux-android/release/eBPFDexDumper
 su -c './eBPFDexDumper dump -n com.example.app -o /data/local/tmp/dex_out'
 su -c './eBPFDexDumper dump -u 10123 -o /data/local/tmp/dex_out'
 su -c './eBPFDexDumper dump -n com.example.app --probe-mode lifecycle'
+su -c './eBPFDexDumper dump -n com.example.app --native-elf-scan'
 
 ./eBPFDexDumper fix -d /data/local/tmp/dex_out
 ./eBPFDexDumper offsets -l /apex/com.android.art/lib64/libart.so
@@ -59,6 +60,7 @@ Useful options:
 - `--no-auto-fix`: do not auto-fix after dumping.
 - `--debug-layout`: print ART layout diagnostics.
 - `--no-code-item-fallback` / `--no-maps-scan` / `--no-native-buffer-scan`: disable fallback paths.
+- `--native-elf-scan`: experimental scan for anonymous executable ARM64 ELF candidates from native loader behavior.
 - `--probe-mode full|lifecycle|maps-only`: reduce the attached probe set when a target performs uprobe checks.
 - `--libc <PATH>`: set the bionic libc path.
 - `--art-layout <LIST>`: provide ART field offsets manually.
@@ -88,6 +90,8 @@ Outputs under `dist/`:
 The default ART layout targets common Android 13+ layouts. Use `--art-layout` when a ROM uses different offsets. If a target only decrypts fragmented method bodies briefly in native code and never keeps a continuous valid DEX in memory, packer-specific hooks are still required.
 
 `full` is the default mode and attaches ART plus libc uprobes. `lifecycle` keeps only DexFile lifecycle probes and maps scan. `maps-only` attaches no uprobes and only scans `/proc/<pid>/maps`. Uprobes can still leave detectable breakpoint-style traces in the target mapping, so use the narrower modes for targets with strong anti-uprobe checks.
+
+`--native-elf-scan` reuses libc `mmap`/`mprotect` events to identify anonymous executable ARM64 ELF candidates and saves them under `native_elf/` in the target output directory. It is an auxiliary diagnostic path for hidden native loaders and does not change the default DEX dump or fix flow.
 
 ## License
 

@@ -33,6 +33,7 @@ sh build_android.sh
 su -c './eBPFDexDumper dump -n com.example.app -o /data/local/tmp/dex_out'
 su -c './eBPFDexDumper dump -u 10123 -o /data/local/tmp/dex_out'
 su -c './eBPFDexDumper dump -n com.example.app --probe-mode lifecycle'
+su -c './eBPFDexDumper dump -n com.example.app --native-elf-scan'
 ./eBPFDexDumper fix -d /data/local/tmp/dex_out/com.example.app
 ./eBPFDexDumper offsets -l /apex/com.android.art/lib64/libart.so
 ./eBPFDexDumper offsets -l /apex/com.android.art/lib64/libart.so --json
@@ -47,6 +48,8 @@ su -c './eBPFDexDumper dump -n com.example.app --probe-mode lifecycle'
 默认 ART layout 按 Android 13+ 常见布局处理；ROM 偏移不一致时使用 `--art-layout`。如果目标只在 native 层短暂解密碎片化方法体，内存中不保留连续合法 DEX，需要按壳适配。
 
 `--probe-mode full|lifecycle|maps-only` 用于按场景收窄探针面：`full` 为默认全量 ART/libc uprobe；`lifecycle` 只保留 DexFile 生命周期探针和 maps 扫描；`maps-only` 不挂 uprobe，只做 `/proc/<pid>/maps` 内存扫描。uprobe 在目标映射上仍可能留下可检测痕迹，强反调试目标可先尝试 `lifecycle` 或 `maps-only`。
+
+`--native-elf-scan` 是实验选项，会复用 libc `mmap`/`mprotect` 事件识别匿名可执行 ARM64 ELF 候选块，并保存到输出子目录的 `native_elf/`。它只作为隐藏 native loader 行为的辅助排查，不影响默认 DEX dump 和回填流程。
 
 ## 许可证
 

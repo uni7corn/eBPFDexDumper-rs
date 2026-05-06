@@ -16,6 +16,7 @@ pub struct DumpConfig {
     pub code_item_fallback: bool,
     pub maps_scan: bool,
     pub native_buffer_scan: bool,
+    pub native_elf_scan: bool,
     pub probe_mode: ProbeMode,
     pub libc: Option<PathBuf>,
 }
@@ -85,6 +86,14 @@ mod imp {
     const DEX_HEADER_SIZE: u32 = 0x70;
     const DEX_ENDIAN_CONSTANT: u32 = 0x1234_5678;
     const MAX_DEX_FILE_SIZE: u32 = 0x4000_0000;
+    const ELF64_HEADER_SIZE: u32 = 0x40;
+    const ELF64_PROGRAM_HEADER_SIZE: u16 = 0x38;
+    const ELF_ET_DYN: u16 = 3;
+    const ELF_EM_AARCH64: u16 = 183;
+    const ELF_PT_LOAD: u32 = 1;
+    const MAX_NATIVE_ELF_SIZE: u64 = 256 * 1024 * 1024;
+    const NATIVE_ELF_BACKSCAN_LIMIT: u64 = 1024 * 1024;
+    const NATIVE_ELF_SCAN_LIMIT: u64 = 4 * 1024 * 1024;
     const CODE_ITEM_BACKSCAN_LIMIT: u64 = 64 * 1024 * 1024;
     const CODE_ITEM_BACKSCAN_STEP: u64 = 0x1000;
     const MAPS_SCAN_MAX_REGION: u64 = 512 * 1024 * 1024;
@@ -120,8 +129,11 @@ mod imp {
     struct DumpState {
         output_dir: PathBuf,
         trace: bool,
+        native_buffer_scan: bool,
+        native_elf_scan: bool,
         dex_cache: RwLock<HashMap<u64, Vec<u8>>>,
         dex_hashes: RwLock<HashSet<[u8; 20]>>,
+        native_elf_cache: RwLock<HashSet<u64>>,
         dex_sizes: RwLock<HashMap<u64, u32>>,
         pending_dex: RwLock<HashMap<u64, DexRecvState>>,
         method_records: RwLock<HashMap<u64, Vec<MethodCodeRecord>>>,
@@ -178,12 +190,20 @@ mod imp {
     }
 
     impl DumpState {
-        fn new(output_dir: PathBuf, trace: bool) -> Self {
+        fn new(
+            output_dir: PathBuf,
+            trace: bool,
+            native_buffer_scan: bool,
+            native_elf_scan: bool,
+        ) -> Self {
             Self {
                 output_dir,
                 trace,
+                native_buffer_scan,
+                native_elf_scan,
                 dex_cache: RwLock::new(HashMap::new()),
                 dex_hashes: RwLock::new(HashSet::new()),
+                native_elf_cache: RwLock::new(HashSet::new()),
                 dex_sizes: RwLock::new(HashMap::new()),
                 pending_dex: RwLock::new(HashMap::new()),
                 method_records: RwLock::new(HashMap::new()),
@@ -398,20 +418,60 @@ mod imp {
                     evt.pid, evt.addr, evt.size, evt.source, evt.prot, evt.flags
                 );
             }
-            match dump_dex_from_native_buffer(evt.pid, evt.addr, evt.size) {
-                Ok(found) => {
-                    for (begin, size, bytes) in found {
-                        self.save_dex(Some(evt.pid), begin, size, bytes);
+            if self.native_buffer_scan {
+                match dump_dex_from_native_buffer(evt.pid, evt.addr, evt.size) {
+                    Ok(found) => {
+                        for (begin, size, bytes) in found {
+                            self.save_dex(Some(evt.pid), begin, size, bytes);
+                        }
+                    }
+                    Err(err) => {
+                        if self.trace {
+                            eprintln!(
+                                "native buffer scan failed for pid={} addr=0x{:x} size=0x{:x}: {err:#}",
+                                evt.pid, evt.addr, evt.size
+                            );
+                        }
                     }
                 }
-                Err(err) => {
-                    if self.trace {
-                        eprintln!(
-                            "native buffer scan failed for pid={} addr=0x{:x} size=0x{:x}: {err:#}",
-                            evt.pid, evt.addr, evt.size
-                        );
+            }
+            if self.native_elf_scan && evt.may_contain_executable_mapping() {
+                match dump_native_elf_from_event(evt.pid, evt.addr, evt.size) {
+                    Ok(Some((base, size, bytes))) => {
+                        self.save_native_elf(evt.pid, base, size, bytes)
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        if self.trace {
+                            eprintln!(
+                                "native ELF scan failed for pid={} addr=0x{:x} size=0x{:x}: {err:#}",
+                                evt.pid, evt.addr, evt.size
+                            );
+                        }
                     }
                 }
+            }
+        }
+
+        fn save_native_elf(&self, pid: u32, base: u64, size: u64, bytes: Vec<u8>) {
+            {
+                let mut cache = self.native_elf_cache.write().unwrap();
+                if !cache.insert(base) {
+                    return;
+                }
+            }
+            let dir = self.output_dir.join("native_elf");
+            if let Err(err) = fs::create_dir_all(&dir) {
+                eprintln!("failed to create {}: {err}", dir.display());
+                return;
+            }
+            let file_name = dir.join(format!("elf_pid{pid}_{base:x}_{size:x}.so"));
+            match fs::write(&file_name, &bytes) {
+                Ok(()) => println!(
+                    "[+] native ELF candidate saved: {} (base=0x{base:x}, size=0x{size:x})",
+                    file_name.display()
+                ),
+                Err(err) => eprintln!("failed to write {}: {err}", file_name.display()),
             }
         }
 
@@ -621,6 +681,14 @@ mod imp {
                 "disabled"
             }
         );
+        println!(
+            "[+] Native ELF scan: {}",
+            if config.native_elf_scan {
+                "enabled (experimental)"
+            } else {
+                "disabled"
+            }
+        );
         println!("[+] Probe mode: {}", config.probe_mode.label());
 
         if !config.probe_mode.uses_bpf() {
@@ -629,7 +697,12 @@ mod imp {
             }
             println!("[+] maps-only mode: no uprobes will be attached");
             install_signal_handlers();
-            let state = DumpState::new(config.out.clone(), config.trace);
+            let state = DumpState::new(
+                config.out.clone(),
+                config.trace,
+                config.native_buffer_scan,
+                false,
+            );
             if let Some(pid) = config.pid {
                 match scan_process_maps(pid) {
                     Ok(dexes) => state.save_scanned_dexes(Some(pid), dexes),
@@ -659,6 +732,7 @@ mod imp {
             .load(BPF_OBJECT)
             .context("failed to load eBPF object")?;
 
+        let native_probe_events_enabled = config.native_buffer_scan || config.native_elf_scan;
         let mut config_map: AyaHashMap<&mut MapData, u32, BpfConfig> =
             AyaHashMap::try_from(ebpf.map_mut("config_map").context("config_map not found")?)?;
         config_map.insert(
@@ -668,7 +742,7 @@ mod imp {
                 pid: config.pid.map(|p| p as i32).unwrap_or(-1),
                 code_item_fallback: u32::from(config.code_item_fallback),
                 debug_layout: u32::from(config.debug_layout),
-                native_buffer_scan: u32::from(config.native_buffer_scan),
+                native_buffer_scan: u32::from(native_probe_events_enabled),
                 reserved: 0,
             },
             0,
@@ -767,22 +841,27 @@ mod imp {
             );
         }
 
-        if config.native_buffer_scan && config.probe_mode.attaches_native_buffer() {
+        if native_probe_events_enabled && config.probe_mode.attaches_native_buffer() {
             if let Some(libc_path) = resolve_libc_path(config.libc.as_deref()) {
                 attach_native_buffer_probes(&mut ebpf, &libc_path);
             } else {
-                eprintln!("[-] libc not found; native buffer scan disabled");
+                eprintln!("[-] libc not found; native scan disabled");
             }
-        } else if config.native_buffer_scan && !config.probe_mode.attaches_native_buffer() {
+        } else if native_probe_events_enabled && !config.probe_mode.attaches_native_buffer() {
             println!(
-                "[+] Native buffer probes skipped by probe mode {}",
+                "[+] Native probes skipped by probe mode {}",
                 config.probe_mode.label()
             );
         }
 
         install_signal_handlers();
 
-        let state = Arc::new(DumpState::new(config.out.clone(), config.trace));
+        let state = Arc::new(DumpState::new(
+            config.out.clone(),
+            config.trace,
+            config.native_buffer_scan,
+            config.native_elf_scan,
+        ));
         // Detach the maps-scan thread on purpose: joining it would block shutdown
         // when an in-flight read_remote_mem on a multi-MB region can't be interrupted.
         // The thread polls keep_running() between regions/pages and exits soon after
@@ -1165,6 +1244,16 @@ mod imp {
                 flags: le32(data, 28)?,
             })
         }
+
+        fn may_contain_executable_mapping(self) -> bool {
+            const NATIVE_SOURCE_MMAP: u32 = 1;
+            const NATIVE_SOURCE_MPROTECT: u32 = 2;
+            const PROT_EXEC: u32 = 0x4;
+
+            matches!(self.source, NATIVE_SOURCE_MMAP | NATIVE_SOURCE_MPROTECT)
+                && self.size >= ELF64_HEADER_SIZE as u64
+                && (self.prot & PROT_EXEC) != 0
+        }
     }
 
     fn dump_dex_from_code_item(
@@ -1296,6 +1385,123 @@ mod imp {
             }
             pos = pos.saturating_add(NATIVE_BUFFER_SCAN_STEP);
         }
+    }
+
+    fn dump_native_elf_from_event(
+        pid: u32,
+        addr: u64,
+        size: u64,
+    ) -> Result<Option<(u64, u64, Vec<u8>)>> {
+        if addr == 0 || size < ELF64_HEADER_SIZE as u64 {
+            return Ok(None);
+        }
+        let start = addr.saturating_sub(NATIVE_ELF_BACKSCAN_LIMIT);
+        let end = addr
+            .checked_add(size.min(NATIVE_ELF_SCAN_LIMIT))
+            .context("native ELF event address overflow")?;
+        let Some(base) = find_native_elf_base(pid, start, end)? else {
+            return Ok(None);
+        };
+        let header = read_remote_mem(pid, base, ELF64_HEADER_SIZE)
+            .with_context(|| format!("read native ELF header from 0x{base:x}"))?;
+        let Some(elf_size) = validate_elf64_header(pid, base, &header)? else {
+            return Ok(None);
+        };
+        if elf_size > MAX_NATIVE_ELF_SIZE {
+            return Ok(None);
+        }
+        let bytes = read_remote_mem(pid, base, elf_size as u32)
+            .with_context(|| format!("read native ELF from 0x{base:x}"))?;
+        Ok(Some((base, elf_size, bytes)))
+    }
+
+    fn find_native_elf_base(pid: u32, start: u64, end: u64) -> Result<Option<u64>> {
+        let mut pos = start & !0xfffu64;
+        while pos + ELF64_HEADER_SIZE as u64 <= end {
+            if !shutdown::keep_running() {
+                return Ok(None);
+            }
+            let remaining = end.saturating_sub(pos);
+            let read_len = remaining.min(NATIVE_ELF_SCAN_LIMIT) as u32;
+            let Ok(page) = read_remote_mem(pid, pos, read_len) else {
+                pos = pos.saturating_add(NATIVE_BUFFER_SCAN_STEP);
+                continue;
+            };
+            let mut off = 0usize;
+            while let Some(idx) = find_subslice(&page[off..], b"\x7fELF") {
+                let base = pos + (off + idx) as u64;
+                if base + ELF64_HEADER_SIZE as u64 <= end {
+                    let header_end = off + idx + ELF64_HEADER_SIZE as usize;
+                    if let Some(header) = page.get(off + idx..header_end) {
+                        if validate_elf64_header(pid, base, header)?.is_some() {
+                            return Ok(Some(base));
+                        }
+                    }
+                }
+                off += idx + 4;
+                if off >= page.len() {
+                    break;
+                }
+            }
+            pos = pos.saturating_add(NATIVE_BUFFER_SCAN_STEP);
+        }
+        Ok(None)
+    }
+
+    fn validate_elf64_header(pid: u32, base: u64, header: &[u8]) -> Result<Option<u64>> {
+        if header.len() < ELF64_HEADER_SIZE as usize || !header.starts_with(b"\x7fELF") {
+            return Ok(None);
+        }
+        if header.get(4) != Some(&2) || header.get(5) != Some(&1) {
+            return Ok(None);
+        }
+        if le16(header, 0x10) != Some(ELF_ET_DYN) || le16(header, 0x12) != Some(ELF_EM_AARCH64) {
+            return Ok(None);
+        }
+        let phoff = le64(header, 0x20).unwrap_or(0);
+        let phentsize = le16(header, 0x36).unwrap_or(0);
+        let phnum = le16(header, 0x38).unwrap_or(0);
+        if phoff == 0 || phentsize < ELF64_PROGRAM_HEADER_SIZE || phnum == 0 || phnum > 128 {
+            return Ok(None);
+        }
+        let ph_size = phentsize as u64 * phnum as u64;
+        if phoff
+            .checked_add(ph_size)
+            .filter(|v| *v <= 1024 * 1024)
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let phdr = read_remote_mem(pid, base + phoff, ph_size as u32)
+            .with_context(|| format!("read native ELF program headers from 0x{base:x}"))?;
+        let mut max_end = 0u64;
+        let mut load_count = 0u32;
+        for idx in 0..phnum as usize {
+            let off = idx * phentsize as usize;
+            let Some(entry) = phdr.get(off..off + phentsize as usize) else {
+                return Ok(None);
+            };
+            if le32(entry, 0) != Some(ELF_PT_LOAD) {
+                continue;
+            }
+            load_count += 1;
+            let p_offset = le64(entry, 0x08).unwrap_or(0);
+            let p_filesz = le64(entry, 0x20).unwrap_or(0);
+            if p_filesz == 0 {
+                continue;
+            }
+            if let Some(seg_end) = p_offset.checked_add(p_filesz) {
+                max_end = max_end.max(seg_end);
+            }
+        }
+        if load_count == 0 || max_end < ELF64_HEADER_SIZE as u64 {
+            return Ok(None);
+        }
+        let size = align_up(max_end, 0x1000);
+        if size > MAX_NATIVE_ELF_SIZE {
+            return Ok(None);
+        }
+        Ok(Some(size))
     }
 
     fn validate_dex_header(header: &[u8]) -> Option<u32> {
@@ -1523,6 +1729,22 @@ mod imp {
             buf.truncate(read);
         }
         Ok(buf)
+    }
+
+    fn align_up(value: u64, align: u64) -> u64 {
+        if align == 0 {
+            return value;
+        }
+        value
+            .checked_add(align - 1)
+            .map(|v| v & !(align - 1))
+            .unwrap_or(value)
+    }
+
+    fn le16(data: &[u8], offset: usize) -> Option<u16> {
+        Some(u16::from_le_bytes(
+            data.get(offset..offset + 2)?.try_into().ok()?,
+        ))
     }
 
     fn le32(data: &[u8], offset: usize) -> Option<u32> {
