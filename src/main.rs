@@ -226,12 +226,24 @@ fn main() -> Result<()> {
                 }
             }
 
+            let subdir = if let Some(pkg) = args.name.as_deref() {
+                platform::sanitize_path_component(pkg)
+            } else if let Some(pid) = args.pid {
+                platform::package_name_from_pid(pid)
+                    .map(|n| platform::sanitize_path_component(&n))
+                    .unwrap_or_else(|| format!("pid_{pid}"))
+            } else {
+                format!("uid_{uid}")
+            };
+            let out_dir = args.out.join(&subdir);
+            println!("[+] Output directory: {}", out_dir.display());
+
             let config = dump::DumpConfig {
                 uid,
                 pid: args.pid,
                 package_name: args.name,
                 libart: args.libart,
-                out: args.out,
+                out: out_dir,
                 trace: args.trace,
                 auto_fix,
                 execute_offset: args.execute_offset,

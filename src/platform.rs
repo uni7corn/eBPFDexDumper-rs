@@ -3,6 +3,42 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub fn is_system_dex_path(path: &str) -> bool {
+    // Conservative filter: drop only paths that exclusively host framework /
+    // boot-class-loader artifacts. Keep /system/app, /system/priv-app and
+    // /data/app paths because users may explicitly dump those system or
+    // 3rd-party apps.
+    if path.is_empty() {
+        return false;
+    }
+    path.starts_with("/apex/")
+        || path.starts_with("/system/framework/")
+        || path.starts_with("/data/dalvik-cache/")
+}
+
+pub fn package_name_from_pid(pid: u32) -> Option<String> {
+    let cmdline = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let first = cmdline.split(|&b| b == 0).next()?;
+    if first.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(first).into_owned())
+}
+
+pub fn sanitize_path_component(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '-' | ':' => c,
+            _ => '_',
+        })
+        .collect();
+    if out.is_empty() || out.starts_with('.') {
+        out.insert(0, '_');
+    }
+    out
+}
+
 pub fn lookup_uid_by_package_name(pkg: &str) -> Result<u32> {
     if let Ok(contents) = fs::read_to_string("/data/system/packages.list") {
         if let Some(uid) = parse_packages_list_for_pkg(&contents, pkg) {

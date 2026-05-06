@@ -22,7 +22,7 @@ pub struct DumpConfig {
 #[cfg(any(target_os = "android", target_os = "linux"))]
 mod imp {
     use super::DumpConfig;
-    use crate::{art, dex::DexParser, fix};
+    use crate::{art, dex::DexParser, fix, shutdown};
     use anyhow::{Context, Result};
     use aya::maps::{HashMap as AyaHashMap, MapData, RingBuf};
     use aya::programs::{ProgramError, UProbe};
@@ -33,7 +33,6 @@ mod imp {
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, RwLock};
     use std::thread;
     use std::time::Duration;
@@ -57,10 +56,8 @@ mod imp {
     const MAPS_SCAN_MAX_REGION: u64 = 512 * 1024 * 1024;
     const NATIVE_BUFFER_SCAN_LIMIT: u64 = 64 * 1024 * 1024;
     const NATIVE_BUFFER_SCAN_STEP: u64 = 0x1000;
-    static RUNNING: AtomicBool = AtomicBool::new(false);
-
     fn keep_running() -> bool {
-        RUNNING.load(Ordering::Acquire)
+        shutdown::keep_running()
     }
 
     #[repr(C)]
@@ -95,6 +92,48 @@ mod imp {
         pending_dex: RwLock<HashMap<u64, DexRecvState>>,
         method_records: RwLock<HashMap<u64, Vec<MethodCodeRecord>>>,
         method_sig_cache: RwLock<HashMap<(u64, u32), String>>,
+        maps_cache: RwLock<HashMap<u32, MapsRegions>>,
+    }
+
+    #[derive(Default, Clone, Debug)]
+    struct MapsRegions {
+        regions: Vec<MapsEntry>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct MapsEntry {
+        start: u64,
+        end: u64,
+        path: String,
+    }
+
+    impl MapsRegions {
+        fn refresh(&mut self, pid: u32) {
+            let Ok(content) = fs::read_to_string(format!("/proc/{pid}/maps")) else {
+                return;
+            };
+            let mut new_regions = Vec::new();
+            for line in content.lines() {
+                if let Some(entry) = parse_maps_entry(line) {
+                    new_regions.push(entry);
+                }
+            }
+            new_regions.sort_by_key(|r| r.start);
+            self.regions = new_regions;
+        }
+
+        fn lookup(&self, addr: u64) -> Option<&str> {
+            let idx = self.regions.partition_point(|r| r.start <= addr);
+            if idx == 0 {
+                return None;
+            }
+            let r = &self.regions[idx - 1];
+            if addr < r.end {
+                Some(r.path.as_str())
+            } else {
+                None
+            }
+        }
     }
 
     #[derive(Clone, Debug)]
@@ -115,6 +154,31 @@ mod imp {
                 pending_dex: RwLock::new(HashMap::new()),
                 method_records: RwLock::new(HashMap::new()),
                 method_sig_cache: RwLock::new(HashMap::new()),
+                maps_cache: RwLock::new(HashMap::new()),
+            }
+        }
+
+        fn lookup_path_for(&self, pid: u32, addr: u64) -> Option<String> {
+            {
+                let cache = self.maps_cache.read().unwrap();
+                if let Some(maps) = cache.get(&pid) {
+                    if let Some(path) = maps.lookup(addr) {
+                        return Some(path.to_string());
+                    }
+                }
+            }
+            let mut cache = self.maps_cache.write().unwrap();
+            let maps = cache.entry(pid).or_default();
+            maps.refresh(pid);
+            maps.lookup(addr).map(|s| s.to_string())
+        }
+
+        fn should_skip_system(&self, pid: u32, addr: u64) -> Option<String> {
+            let path = self.lookup_path_for(pid, addr)?;
+            if crate::platform::is_system_dex_path(&path) {
+                Some(path)
+            } else {
+                None
             }
         }
 
@@ -167,7 +231,7 @@ mod imp {
             };
 
             if let Some((begin, size, bytes)) = maybe_complete {
-                self.save_dex(begin, size, bytes);
+                self.save_dex(Some(hdr.pid), begin, size, bytes);
             }
         }
 
@@ -225,14 +289,22 @@ mod imp {
                 eprintln!("Read failure event too short: {} bytes", data.len());
                 return;
             };
-            eprintln!(
-                "eBPF read failed at offset {} for dex 0x{:x} (pid={}); using process_vm_readv fallback",
-                evt.failed_offset, evt.begin, evt.pid
-            );
+            if !shutdown::keep_running() {
+                return;
+            }
+            // Expected path: bpf_probe_read_user can't fault in pages, so any DEX
+            // page that isn't resident yet routes through the userspace fallback.
+            // Only surface it under --trace; failures of the fallback itself stay loud.
+            if self.trace {
+                eprintln!(
+                    "[~] dex 0x{:x} offset {} not resident at probe time (pid={}); fetching via process_vm_readv",
+                    evt.begin, evt.failed_offset, evt.pid
+                );
+            }
             match read_remote_mem(evt.pid, evt.begin, evt.size) {
                 Ok(bytes) => {
                     self.pending_dex.write().unwrap().remove(&evt.begin);
-                    self.save_dex(evt.begin, evt.size, bytes);
+                    self.save_dex(Some(evt.pid), evt.begin, evt.size, bytes);
                 }
                 Err(err) => eprintln!("process_vm_readv failed for dex 0x{:x}: {err:#}", evt.begin),
             }
@@ -243,6 +315,9 @@ mod imp {
                 eprintln!("Layout debug event too short: {} bytes", data.len());
                 return;
             };
+            if !shutdown::keep_running() {
+                return;
+            }
             if self.trace {
                 println!(
                     "layout event pid={} art_method=0x{:x} code_item=0x{:x} begin=0x{:x} size={} reason={} source={}",
@@ -259,7 +334,7 @@ mod imp {
                 return;
             }
             match dump_dex_from_code_item(evt.pid, evt.code_item_ptr) {
-                Ok(Some((begin, size, bytes))) => self.save_dex(begin, size, bytes),
+                Ok(Some((begin, size, bytes))) => self.save_dex(Some(evt.pid), begin, size, bytes),
                 Ok(None) => {
                     if self.trace {
                         eprintln!(
@@ -280,6 +355,9 @@ mod imp {
                 eprintln!("Native buffer event too short: {} bytes", data.len());
                 return;
             };
+            if !shutdown::keep_running() {
+                return;
+            }
             if self.trace {
                 println!(
                     "native buffer event pid={} addr=0x{:x} size=0x{:x} source={} prot=0x{:x} flags=0x{:x}",
@@ -289,7 +367,7 @@ mod imp {
             match dump_dex_from_native_buffer(evt.pid, evt.addr, evt.size) {
                 Ok(found) => {
                     for (begin, size, bytes) in found {
-                        self.save_dex(begin, size, bytes);
+                        self.save_dex(Some(evt.pid), begin, size, bytes);
                     }
                 }
                 Err(err) => {
@@ -303,7 +381,17 @@ mod imp {
             }
         }
 
-        fn save_dex(&self, begin: u64, size: u32, bytes: Vec<u8>) {
+        fn save_dex(&self, pid: Option<u32>, begin: u64, size: u32, bytes: Vec<u8>) {
+            if let Some(pid) = pid {
+                if let Some(path) = self.should_skip_system(pid, begin) {
+                    if self.trace {
+                        eprintln!(
+                            "[~] skip system dex 0x{begin:x} pid={pid} path={path}"
+                        );
+                    }
+                    return;
+                }
+            }
             {
                 let mut cache = self.dex_cache.write().unwrap();
                 if cache.contains_key(&begin) {
@@ -417,8 +505,8 @@ mod imp {
         }
 
         fn scan_uid_maps_once(&self, uid: u32) {
-            match scan_uid_maps(uid) {
-                Ok(found) => self.save_scanned_dexes(found),
+            match scan_uid_maps(uid, self.trace) {
+                Ok(found) => self.save_scanned_dexes(None, found),
                 Err(err) => {
                     if self.trace {
                         eprintln!("maps scan skipped: {err:#}");
@@ -427,9 +515,9 @@ mod imp {
             }
         }
 
-        fn save_scanned_dexes(&self, dexes: Vec<(u64, u32, Vec<u8>)>) {
+        fn save_scanned_dexes(&self, pid: Option<u32>, dexes: Vec<(u64, u32, Vec<u8>)>) {
             for (begin, size, bytes) in dexes {
-                self.save_dex(begin, size, bytes);
+                self.save_dex(pid, begin, size, bytes);
             }
         }
 
@@ -437,8 +525,12 @@ mod imp {
             let state = Arc::clone(self);
             thread::spawn(move || match pid {
                 Some(pid) => match scan_process_maps(pid) {
-                    Ok(dexes) => state.save_scanned_dexes(dexes),
-                    Err(err) => eprintln!("maps scan failed for pid {pid}: {err:#}"),
+                    Ok(dexes) => state.save_scanned_dexes(Some(pid), dexes),
+                    Err(err) => {
+                        if state.trace {
+                            eprintln!("maps scan failed for pid {pid}: {err:#}");
+                        }
+                    }
                 },
                 None => state.scan_uid_maps_once(uid),
             })
@@ -612,15 +704,16 @@ mod imp {
             }
         }
 
-        RUNNING.store(true, Ordering::SeqCst);
         install_signal_handlers();
 
         let state = Arc::new(DumpState::new(config.out.clone(), config.trace));
-        let maps_scan_thread = if config.maps_scan {
-            Some(state.spawn_maps_scan(config.uid, config.pid))
-        } else {
-            None
-        };
+        // Detach the maps-scan thread on purpose: joining it would block shutdown
+        // when an in-flight read_remote_mem on a multi-MB region can't be interrupted.
+        // The thread polls keep_running() between regions/pages and exits soon after
+        // the first Ctrl+C; whatever is left in flight gets reaped on process exit.
+        if config.maps_scan {
+            let _ = state.spawn_maps_scan(config.uid, config.pid);
+        }
 
         let mut events =
             RingBuf::try_from(ebpf.take_map("events").context("events map not found")?)?;
@@ -646,7 +739,7 @@ mod imp {
         )?;
 
         println!("eBPF DexDumper started successfully");
-        while RUNNING.load(Ordering::SeqCst) {
+        while shutdown::keep_running() {
             drain_ring(&mut events, |data| state.handle_dex_event(data));
             drain_ring(&mut method_events, |data| state.handle_method_event(data));
             drain_ring(&mut dex_chunks, |data| state.handle_dex_chunk(data));
@@ -659,13 +752,12 @@ mod imp {
             });
             thread::sleep(Duration::from_millis(50));
         }
-        if let Some(handle) = maps_scan_thread {
-            if handle.join().is_err() {
-                eprintln!("[!] maps scan thread panicked");
-            }
-        }
 
         println!("Stopping eBPF DexDumper");
+        // Detach all uprobes before the post-loop drain so the ring buffers stop
+        // growing. Without this, busy ART processes can refill the rings as fast
+        // as we drain them, livelocking shutdown.
+        drop(ebpf);
         drain_ring(&mut events, |data| state.handle_dex_event(data));
         drain_ring(&mut method_events, |data| state.handle_method_event(data));
         drain_ring(&mut dex_chunks, |data| state.handle_dex_chunk(data));
@@ -678,7 +770,7 @@ mod imp {
         });
         state.flush_json()?;
         if config.auto_fix {
-            println!("[+] Auto-fixing DEX files...");
+            println!("[+] Auto-fixing DEX files... (press Ctrl+C again to skip)");
             if let Err(err) = fix::fix_dex_directory(&config.out) {
                 eprintln!("[!] Auto-fix failed: {err:#}");
             }
@@ -782,11 +874,18 @@ mod imp {
         None
     }
 
+    const DRAIN_BATCH_LIMIT: usize = 1024;
+
     fn drain_ring<T: std::borrow::Borrow<MapData>, F: FnMut(&[u8])>(
         ring: &mut RingBuf<T>,
         mut handler: F,
     ) {
-        while let Some(item) = ring.next() {
+        // Cap per-call work so a high event rate can't livelock the main loop and
+        // hide the keep_running() check between iterations.
+        for _ in 0..DRAIN_BATCH_LIMIT {
+            let Some(item) = ring.next() else {
+                return;
+            };
             handler(&item);
         }
     }
@@ -850,7 +949,7 @@ mod imp {
     }
 
     extern "C" fn signal_handler(_: libc::c_int) {
-        RUNNING.store(false, Ordering::SeqCst);
+        shutdown::request_stop();
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -871,6 +970,7 @@ mod imp {
     #[derive(Clone, Copy, Debug)]
     struct DexChunkEvent {
         begin: u64,
+        pid: u32,
         size: u32,
         offset: u32,
         data_len: u32,
@@ -883,6 +983,7 @@ mod imp {
             }
             Some(Self {
                 begin: le64(data, 0)?,
+                pid: le32(data, 8)?,
                 size: le32(data, 12)?,
                 offset: le32(data, 16)?,
                 data_len: le32(data, 20)?,
@@ -1000,6 +1101,9 @@ mod imp {
         let mut scan = code_item_ptr & !(CODE_ITEM_BACKSCAN_STEP - 1);
         let scan_floor = code_item_ptr.saturating_sub(CODE_ITEM_BACKSCAN_LIMIT);
         while scan >= scan_floor {
+            if !shutdown::keep_running() {
+                return Ok(None);
+            }
             let Ok(page) = read_remote_mem(pid, scan, CODE_ITEM_BACKSCAN_STEP as u32) else {
                 if scan < CODE_ITEM_BACKSCAN_STEP {
                     break;
@@ -1083,6 +1187,9 @@ mod imp {
     ) {
         let mut pos = start;
         while pos + DEX_HEADER_SIZE as u64 <= end {
+            if !shutdown::keep_running() {
+                return;
+            }
             let remaining = end.saturating_sub(pos);
             let read_len = remaining.min(NATIVE_BUFFER_SCAN_STEP) as u32;
             let Ok(page) = read_remote_mem(pid, pos, read_len) else {
@@ -1150,7 +1257,7 @@ mod imp {
         Some(file_size)
     }
 
-    fn scan_uid_maps(uid: u32) -> Result<Vec<(u64, u32, Vec<u8>)>> {
+    fn scan_uid_maps(uid: u32, trace: bool) -> Result<Vec<(u64, u32, Vec<u8>)>> {
         let mut found = Vec::new();
         for pid in pids_for_uid(uid)? {
             if !keep_running() {
@@ -1158,7 +1265,11 @@ mod imp {
             }
             match scan_process_maps(pid) {
                 Ok(mut dexes) => found.append(&mut dexes),
-                Err(err) => eprintln!("maps scan failed for pid {pid}: {err:#}"),
+                Err(err) => {
+                    if trace {
+                        eprintln!("maps scan failed for pid {pid}: {err:#}");
+                    }
+                }
             }
         }
         Ok(found)
@@ -1206,15 +1317,19 @@ mod imp {
             if region.end <= region.start || region.end - region.start > MAPS_SCAN_MAX_REGION {
                 continue;
             }
+            if crate::platform::is_system_dex_path(&region.path) {
+                continue;
+            }
             scan_region_for_dex(pid, region.start, region.end, &mut found);
         }
         Ok(found)
     }
 
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Debug)]
     struct MapRegion {
         start: u64,
         end: u64,
+        path: String,
     }
 
     fn parse_readable_map_region(line: &str) -> Option<MapRegion> {
@@ -1224,10 +1339,32 @@ mod imp {
         if !perms.starts_with('r') {
             return None;
         }
+        // skip offset, dev, inode
+        let _ = parts.next()?;
+        let _ = parts.next()?;
+        let _ = parts.next()?;
+        let path = parts.collect::<Vec<_>>().join(" ");
         let (start, end) = range.split_once('-')?;
         Some(MapRegion {
             start: u64::from_str_radix(start, 16).ok()?,
             end: u64::from_str_radix(end, 16).ok()?,
+            path,
+        })
+    }
+
+    fn parse_maps_entry(line: &str) -> Option<MapsEntry> {
+        let mut parts = line.split_whitespace();
+        let range = parts.next()?;
+        let _perms = parts.next()?;
+        let _ = parts.next()?;
+        let _ = parts.next()?;
+        let _ = parts.next()?;
+        let path = parts.collect::<Vec<_>>().join(" ");
+        let (start, end) = range.split_once('-')?;
+        Some(MapsEntry {
+            start: u64::from_str_radix(start, 16).ok()?,
+            end: u64::from_str_radix(end, 16).ok()?,
+            path,
         })
     }
 

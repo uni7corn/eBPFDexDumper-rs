@@ -36,6 +36,10 @@ pub fn fix_dex_directory(output_dir: &Path) -> Result<()> {
         .with_context(|| format!("failed to create {}", final_dir.display()))?;
 
     for (base, dex_path) in dex_files {
+        if !crate::shutdown::keep_finalizing() {
+            eprintln!("[!] auto-fix aborted by user; remaining files left as-is");
+            break;
+        }
         let final_path = final_dir.join(format!("{base}.dex"));
         match pairs.get(&base) {
             Some(json_path) => {
