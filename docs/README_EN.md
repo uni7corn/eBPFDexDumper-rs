@@ -45,6 +45,7 @@ target/aarch64-linux-android/release/eBPFDexDumper
 
 su -c './eBPFDexDumper dump -n com.example.app -o /data/local/tmp/dex_out'
 su -c './eBPFDexDumper dump -u 10123 -o /data/local/tmp/dex_out'
+su -c './eBPFDexDumper dump -n com.example.app --probe-mode lifecycle'
 
 ./eBPFDexDumper fix -d /data/local/tmp/dex_out
 ./eBPFDexDumper offsets -l /apex/com.android.art/lib64/libart.so
@@ -58,6 +59,7 @@ Useful options:
 - `--no-auto-fix`: do not auto-fix after dumping.
 - `--debug-layout`: print ART layout diagnostics.
 - `--no-code-item-fallback` / `--no-maps-scan` / `--no-native-buffer-scan`: disable fallback paths.
+- `--probe-mode full|lifecycle|maps-only`: reduce the attached probe set when a target performs uprobe checks.
 - `--libc <PATH>`: set the bionic libc path.
 - `--art-layout <LIST>`: provide ART field offsets manually.
 
@@ -84,6 +86,8 @@ Outputs under `dist/`:
 `dump` runs `fix` on exit by default. The original `dex_*.dex` files remain in the output directory; `fix/` stores repaired copies when bytecode records can be applied; `final/` is the usable result set, preferring repaired DEX files and falling back to original dumps when no matching `_code.json` exists or repair fails.
 
 The default ART layout targets common Android 13+ layouts. Use `--art-layout` when a ROM uses different offsets. If a target only decrypts fragmented method bodies briefly in native code and never keeps a continuous valid DEX in memory, packer-specific hooks are still required.
+
+`full` is the default mode and attaches ART plus libc uprobes. `lifecycle` keeps only DexFile lifecycle probes and maps scan. `maps-only` attaches no uprobes and only scans `/proc/<pid>/maps`. Uprobes can still leave detectable breakpoint-style traces in the target mapping, so use the narrower modes for targets with strong anti-uprobe checks.
 
 ## License
 

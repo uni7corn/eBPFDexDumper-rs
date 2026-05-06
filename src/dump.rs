@@ -16,7 +16,41 @@ pub struct DumpConfig {
     pub code_item_fallback: bool,
     pub maps_scan: bool,
     pub native_buffer_scan: bool,
+    pub probe_mode: ProbeMode,
     pub libc: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProbeMode {
+    Full,
+    Lifecycle,
+    MapsOnly,
+}
+
+impl ProbeMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Lifecycle => "lifecycle",
+            Self::MapsOnly => "maps-only",
+        }
+    }
+
+    pub fn uses_bpf(self) -> bool {
+        !matches!(self, Self::MapsOnly)
+    }
+
+    pub fn attaches_interpreter(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    pub fn attaches_lifecycle(self) -> bool {
+        matches!(self, Self::Full | Self::Lifecycle)
+    }
+
+    pub fn attaches_native_buffer(self) -> bool {
+        matches!(self, Self::Full)
+    }
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -385,9 +419,7 @@ mod imp {
             if let Some(pid) = pid {
                 if let Some(path) = self.should_skip_system(pid, begin) {
                     if self.trace {
-                        eprintln!(
-                            "[~] skip system dex 0x{begin:x} pid={pid} path={path}"
-                        );
+                        eprintln!("[~] skip system dex 0x{begin:x} pid={pid} path={path}");
                     }
                     return;
                 }
@@ -589,6 +621,33 @@ mod imp {
                 "disabled"
             }
         );
+        println!("[+] Probe mode: {}", config.probe_mode.label());
+
+        if !config.probe_mode.uses_bpf() {
+            if !config.maps_scan {
+                anyhow::bail!("--probe-mode maps-only requires maps scan; remove --no-maps-scan");
+            }
+            println!("[+] maps-only mode: no uprobes will be attached");
+            install_signal_handlers();
+            let state = DumpState::new(config.out.clone(), config.trace);
+            if let Some(pid) = config.pid {
+                match scan_process_maps(pid) {
+                    Ok(dexes) => state.save_scanned_dexes(Some(pid), dexes),
+                    Err(err) => eprintln!("maps scan failed for pid {pid}: {err:#}"),
+                }
+            } else {
+                state.scan_uid_maps_once(config.uid);
+            }
+            state.flush_json()?;
+            if config.auto_fix {
+                println!("[+] Auto-fixing DEX files...");
+                if let Err(err) = fix::fix_dex_directory(&config.out) {
+                    eprintln!("[!] Auto-fix failed: {err:#}");
+                }
+            }
+            println!("DexDumper stopped");
+            return Ok(());
+        }
 
         let asset_btf = load_asset_btf();
         let mut loader = EbpfLoader::new();
@@ -622,86 +681,103 @@ mod imp {
         layout_map.insert(0, runtime_layout, 0)?;
         println!("[+] Filtering on uid {}", config.uid);
 
-        let mut attached_main = 0usize;
-        if let Some(target) = targets.execute {
-            attach_probe(
-                &mut ebpf,
-                "uprobe_libart_execute",
-                &config.libart,
-                target.addr,
-            )
-            .context("failed to attach Execute uprobe")?;
-            attached_main += 1;
+        let mut attached_art = 0usize;
+        if config.probe_mode.attaches_interpreter() {
+            if let Some(target) = targets.execute {
+                attach_probe(
+                    &mut ebpf,
+                    "uprobe_libart_execute",
+                    &config.libart,
+                    target.addr,
+                )
+                .context("failed to attach Execute uprobe")?;
+                attached_art += 1;
+            }
+            if let Some(target) = targets.execute_nterp {
+                attach_probe(
+                    &mut ebpf,
+                    "uprobe_libart_executeNterpImpl",
+                    &config.libart,
+                    target.addr,
+                )
+                .context("failed to attach ExecuteNterpImpl uprobe")?;
+                attached_art += 1;
+            }
+            if let Some(target) = targets.execute_nterp_with_clinit {
+                attach_probe(
+                    &mut ebpf,
+                    "uprobe_libart_executeNterpImpl",
+                    &config.libart,
+                    target.addr,
+                )
+                .context("failed to attach ExecuteNterpWithClinitImpl uprobe")?;
+                attached_art += 1;
+            }
+
+            for target in targets.nterp_invoke_addrs {
+                if let Err(err) = attach_probe(
+                    &mut ebpf,
+                    "uprobe_libart_nterpOpInvoke",
+                    &config.libart,
+                    target.addr,
+                ) {
+                    eprintln!(
+                        "[-] failed to attach nterp_op_invoke_* at 0x{:x}: {err:#}",
+                        target.addr
+                    );
+                }
+            }
         }
-        if let Some(target) = targets.execute_nterp {
-            attach_probe(
-                &mut ebpf,
-                "uprobe_libart_executeNterpImpl",
-                &config.libart,
-                target.addr,
-            )
-            .context("failed to attach ExecuteNterpImpl uprobe")?;
-            attached_main += 1;
+        if config.probe_mode.attaches_lifecycle() {
+            if let Some(target) = targets.dex_file_ctor {
+                if let Err(err) = attach_probe(
+                    &mut ebpf,
+                    "uprobe_libart_dexFileCtor",
+                    &config.libart,
+                    target.addr,
+                ) {
+                    eprintln!(
+                        "[-] failed to attach DexFile::DexFile at 0x{:x}: {err:#}",
+                        target.addr
+                    );
+                } else {
+                    attached_art += 1;
+                }
+            }
+            if let Some(target) = targets.register_dex_file {
+                if let Err(err) = attach_probe(
+                    &mut ebpf,
+                    "uprobe_libart_registerDexFile",
+                    &config.libart,
+                    target.addr,
+                ) {
+                    eprintln!(
+                        "[-] failed to attach RegisterDexFile at 0x{:x}: {err:#}",
+                        target.addr
+                    );
+                } else {
+                    attached_art += 1;
+                }
+            }
         }
-        if let Some(target) = targets.execute_nterp_with_clinit {
-            attach_probe(
-                &mut ebpf,
-                "uprobe_libart_executeNterpImpl",
-                &config.libart,
-                target.addr,
-            )
-            .context("failed to attach ExecuteNterpWithClinitImpl uprobe")?;
-            attached_main += 1;
-        }
-        if attached_main == 0 {
-            anyhow::bail!("no ART main entry uprobe was attached");
+        if attached_art == 0 {
+            anyhow::bail!(
+                "no ART uprobe was attached for probe mode {}",
+                config.probe_mode.label()
+            );
         }
 
-        for target in targets.nterp_invoke_addrs {
-            if let Err(err) = attach_probe(
-                &mut ebpf,
-                "uprobe_libart_nterpOpInvoke",
-                &config.libart,
-                target.addr,
-            ) {
-                eprintln!(
-                    "[-] failed to attach nterp_op_invoke_* at 0x{:x}: {err:#}",
-                    target.addr
-                );
-            }
-        }
-        if let Some(target) = targets.dex_file_ctor {
-            if let Err(err) = attach_probe(
-                &mut ebpf,
-                "uprobe_libart_dexFileCtor",
-                &config.libart,
-                target.addr,
-            ) {
-                eprintln!(
-                    "[-] failed to attach DexFile::DexFile at 0x{:x}: {err:#}",
-                    target.addr
-                );
-            }
-        }
-        if let Some(target) = targets.register_dex_file {
-            if let Err(err) = attach_probe(
-                &mut ebpf,
-                "uprobe_libart_registerDexFile",
-                &config.libart,
-                target.addr,
-            ) {
-                eprintln!(
-                    "[-] failed to attach RegisterDexFile at 0x{:x}: {err:#}",
-                    target.addr
-                );
-            }
-        }
-        if config.native_buffer_scan {
+        if config.native_buffer_scan && config.probe_mode.attaches_native_buffer() {
             if let Some(libc_path) = resolve_libc_path(config.libc.as_deref()) {
                 attach_native_buffer_probes(&mut ebpf, &libc_path);
             } else {
                 eprintln!("[-] libc not found; native buffer scan disabled");
             }
+        } else if config.native_buffer_scan && !config.probe_mode.attaches_native_buffer() {
+            println!(
+                "[+] Native buffer probes skipped by probe mode {}",
+                config.probe_mode.label()
+            );
         }
 
         install_signal_handlers();
@@ -1514,6 +1590,7 @@ mod imp {
             config.code_item_fallback,
             config.maps_scan,
             config.native_buffer_scan,
+            config.probe_mode,
             config.libc,
         );
         anyhow::bail!("live dump is available only when built for Linux/Android")

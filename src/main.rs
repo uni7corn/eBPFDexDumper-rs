@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use ebpf_dex_dumper_rs::{art, dump, fix, platform};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -101,9 +101,33 @@ struct DumpArgs {
     #[arg(long)]
     no_native_buffer_scan: bool,
 
+    /// Probe set to attach: full, lifecycle, or maps-only.
+    #[arg(long, value_enum, default_value_t = ProbeModeArg::Full)]
+    probe_mode: ProbeModeArg,
+
     /// Path to libc.so used for native buffer probes.
     #[arg(long)]
     libc: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProbeModeArg {
+    /// Attach ART interpreter, DexFile lifecycle, nterp invoke, and libc native buffer probes.
+    Full,
+    /// Attach only DexFile lifecycle probes; keeps maps scan but reduces uprobe footprint.
+    Lifecycle,
+    /// Do not attach uprobes; only scan target process maps.
+    MapsOnly,
+}
+
+impl From<ProbeModeArg> for dump::ProbeMode {
+    fn from(value: ProbeModeArg) -> Self {
+        match value {
+            ProbeModeArg::Full => Self::Full,
+            ProbeModeArg::Lifecycle => Self::Lifecycle,
+            ProbeModeArg::MapsOnly => Self::MapsOnly,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -253,6 +277,7 @@ fn main() -> Result<()> {
                 code_item_fallback: !args.no_code_item_fallback,
                 maps_scan: !args.no_maps_scan,
                 native_buffer_scan: !args.no_native_buffer_scan,
+                probe_mode: args.probe_mode.into(),
                 libc: args.libc,
             };
             dump::run(config)
