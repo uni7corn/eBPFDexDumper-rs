@@ -3,7 +3,7 @@ use adler2::Adler32;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -31,6 +31,46 @@ pub struct FixOptions {
     pub force_mismatch: bool,
 }
 
+/// One non-abstract / non-native method whose bytecode we did not capture.
+/// Surfaced after a fix pass so the user can tell what coverage gaps remain.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MissedMethod {
+    pub method_idx: u32,
+    pub code_off: u32,
+    /// Pretty-printed Java-style signature, when the DEX id tables resolve.
+    /// Best-effort: packers sometimes corrupt string tables, in which case we
+    /// emit the method index alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// Coverage of one DEX file's bytecode after fix has applied all records.
+/// `total_methods` counts methods whose `code_off != 0` in the DEX
+/// (abstract/native methods are excluded — there's no bytecode to capture).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CoverageReport {
+    pub total_methods: usize,
+    pub captured_methods: usize,
+    pub missed_methods: Vec<MissedMethod>,
+}
+
+impl CoverageReport {
+    pub fn ratio(&self) -> f64 {
+        if self.total_methods == 0 {
+            1.0
+        } else {
+            self.captured_methods as f64 / self.total_methods as f64
+        }
+    }
+}
+
+/// Combined result of fixing one DEX: bytecode-write stats plus coverage.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FixOutcome {
+    pub stats: FixStats,
+    pub coverage: CoverageReport,
+}
+
 pub fn fix_dex_directory(output_dir: &Path) -> Result<()> {
     fix_dex_directory_with(output_dir, FixOptions::default())
 }
@@ -55,19 +95,42 @@ pub fn fix_dex_directory_with(output_dir: &Path, options: FixOptions) -> Result<
             break;
         }
         let final_path = final_dir.join(format!("{base}.dex"));
+        let display_name = dex_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         match pairs.get(&base) {
             Some(json_path) => {
                 let out_path = fix_dir.join(format!("{base}_fix.dex"));
                 match fix_one_dex(&dex_path, json_path, &out_path, options) {
-                    Ok(stats) => {
+                    Ok(outcome) => {
                         println!(
-                            "Applied: {}, Skipped: {}, LengthMismatch: {} for {}",
-                            stats.applied,
-                            stats.skipped,
-                            stats.length_mismatch,
-                            dex_path.file_name().unwrap_or_default().to_string_lossy()
+                            "Applied: {}, Skipped: {}, LengthMismatch: {} for {display_name}",
+                            outcome.stats.applied,
+                            outcome.stats.skipped,
+                            outcome.stats.length_mismatch,
+                        );
+                        let coverage = &outcome.coverage;
+                        println!(
+                            "Coverage: {}/{} methods ({:.2}%), {} missed for {display_name}",
+                            coverage.captured_methods,
+                            coverage.total_methods,
+                            coverage.ratio() * 100.0,
+                            coverage.missed_methods.len(),
                         );
                         copy_file(&out_path, &final_path)?;
+                        if !coverage.missed_methods.is_empty() {
+                            let missed_path = final_dir.join(format!("{base}_missed.json"));
+                            if let Err(err) = write_coverage_report(&missed_path, coverage) {
+                                eprintln!(
+                                    "[!] failed to write coverage report {}: {err:#}",
+                                    missed_path.display()
+                                );
+                            } else {
+                                println!("[+] Missed {}", missed_path.display());
+                            }
+                        }
                         println!("[+] Wrote {}", out_path.display());
                         println!("[+] Final {}", final_path.display());
                     }
@@ -88,31 +151,79 @@ pub fn fix_dex_directory_with(output_dir: &Path, options: FixOptions) -> Result<
     Ok(())
 }
 
+fn write_coverage_report(path: &Path, coverage: &CoverageReport) -> Result<()> {
+    let file = fs::File::create(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    serde_json::to_writer_pretty(file, coverage)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
 pub fn fix_one_dex(
     dex_path: &Path,
     json_path: &Path,
     out_path: &Path,
     options: FixOptions,
-) -> Result<FixStats> {
+) -> Result<FixOutcome> {
     let mut dex_bytes =
         fs::read(dex_path).with_context(|| format!("failed to read {}", dex_path.display()))?;
-    let stats = fix_one_dex_bytes_from_json_file(&mut dex_bytes, json_path, options)?;
+    let outcome = fix_one_dex_bytes_from_json_file(&mut dex_bytes, json_path, options)?;
     fs::write(out_path, &dex_bytes)
         .with_context(|| format!("failed to write {}", out_path.display()))?;
-    Ok(stats)
+    Ok(outcome)
 }
 
 pub fn fix_one_dex_bytes_from_json_file(
     dex_bytes: &mut [u8],
     json_path: &Path,
     options: FixOptions,
-) -> Result<FixStats> {
+) -> Result<FixOutcome> {
     let parser = DexParser::new(dex_bytes)?;
     let method2off = build_method_code_off_map(&parser)?;
     let records = read_records(json_path)?;
+    let coverage = compute_coverage(&parser, &method2off, &records);
+    // `parser`'s immutable borrow of `dex_bytes` ends here under NLL, so the
+    // next line's `&mut dex_bytes` is allowed.
+    let _ = parser;
     let stats = apply_records_to_dex(dex_bytes, &method2off, &records, options)?;
     recalc_dex_header(dex_bytes);
-    Ok(stats)
+    Ok(FixOutcome { stats, coverage })
+}
+
+/// Compute method-coverage statistics for a DEX given the records we captured
+/// for it. Counts every method whose `code_off != 0` (i.e. has bytecode in the
+/// DEX) and reports which method indices were missing from the records.
+pub fn compute_coverage(
+    parser: &DexParser<'_>,
+    method2off: &HashMap<u32, u32>,
+    records: &[MethodCodeRecord],
+) -> CoverageReport {
+    let captured: HashSet<u32> = records.iter().map(|r| r.method_idx).collect();
+    let mut missed = Vec::new();
+    let mut total = 0usize;
+    for (&method_idx, &code_off) in method2off {
+        if code_off == 0 {
+            continue;
+        }
+        total += 1;
+        if !captured.contains(&method_idx) {
+            let signature = parser
+                .get_method_info(method_idx)
+                .ok()
+                .map(|info| info.pretty_method());
+            missed.push(MissedMethod {
+                method_idx,
+                code_off,
+                signature,
+            });
+        }
+    }
+    missed.sort_by_key(|m| m.method_idx);
+    CoverageReport {
+        total_methods: total,
+        captured_methods: total.saturating_sub(missed.len()),
+        missed_methods: missed,
+    }
 }
 
 pub fn apply_records_to_dex(
@@ -408,6 +519,79 @@ mod tests {
         assert_eq!(&fixed_final[0xa0..0xa4], &[1, 2, 3, 4]);
         assert_eq!(fixed_final, fixed_copy);
         assert_eq!(original_final, fs::read(original_dex_path).unwrap());
+    }
+
+    #[test]
+    fn coverage_reports_missed_methods() {
+        let dex = minimal_dex_with_code_item();
+        let parser = DexParser::new(&dex).unwrap();
+        let map = build_method_code_off_map(&parser).unwrap();
+
+        // No records — the lone method with code_off should appear as missed.
+        let report = compute_coverage(&parser, &map, &[]);
+        assert_eq!(report.total_methods, 1);
+        assert_eq!(report.captured_methods, 0);
+        assert_eq!(report.missed_methods.len(), 1);
+        assert_eq!(report.missed_methods[0].method_idx, 0);
+        assert_eq!(report.missed_methods[0].code_off, 0x90);
+        // The fixture has zero string/method ids, so signature resolution
+        // should fail gracefully and emit None.
+        assert_eq!(report.missed_methods[0].signature, None);
+
+        // With a record covering method_idx 0, coverage hits 100%.
+        let records = vec![MethodCodeRecord {
+            name: "void Lx;.m()".to_string(),
+            method_idx: 0,
+            code: "01020304".to_string(),
+        }];
+        let report = compute_coverage(&parser, &map, &records);
+        assert_eq!(report.total_methods, 1);
+        assert_eq!(report.captured_methods, 1);
+        assert!(report.missed_methods.is_empty());
+        assert_eq!(report.ratio(), 1.0);
+    }
+
+    #[test]
+    fn fix_directory_writes_missed_report_only_when_needed() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = "dex_4000_b0";
+
+        let dex_path = dir.path().join(format!("{base}.dex"));
+        let json_path = dir.path().join(format!("{base}_code.json"));
+        fs::write(&dex_path, minimal_dex_with_code_item()).unwrap();
+        // Empty records → 1 method, 0 captured, 1 missed → missed.json must
+        // be produced.
+        fs::write(&json_path, "[]").unwrap();
+
+        fix_dex_directory(dir.path()).unwrap();
+
+        let missed_path = dir.path().join("final").join(format!("{base}_missed.json"));
+        let raw = fs::read_to_string(&missed_path).unwrap();
+        let report: CoverageReport = serde_json::from_str(&raw).unwrap();
+        assert_eq!(report.total_methods, 1);
+        assert_eq!(report.captured_methods, 0);
+        assert_eq!(report.missed_methods.len(), 1);
+        assert_eq!(report.missed_methods[0].method_idx, 0);
+    }
+
+    #[test]
+    fn fix_directory_skips_missed_report_at_full_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = "dex_5000_b0";
+
+        let dex_path = dir.path().join(format!("{base}.dex"));
+        let json_path = dir.path().join(format!("{base}_code.json"));
+        fs::write(&dex_path, minimal_dex_with_code_item()).unwrap();
+        fs::write(
+            &json_path,
+            r#"[{"name":"void Lx;.m()","method_idx":0,"code":"01020304"}]"#,
+        )
+        .unwrap();
+
+        fix_dex_directory(dir.path()).unwrap();
+
+        let missed_path = dir.path().join("final").join(format!("{base}_missed.json"));
+        assert!(!missed_path.exists(), "no missed.json should be written at 100% coverage");
     }
 
     #[test]
