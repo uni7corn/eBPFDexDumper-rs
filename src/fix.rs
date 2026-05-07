@@ -152,8 +152,8 @@ pub fn fix_dex_directory_with(output_dir: &Path, options: FixOptions) -> Result<
 }
 
 fn write_coverage_report(path: &Path, coverage: &CoverageReport) -> Result<()> {
-    let file = fs::File::create(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
+    let file =
+        fs::File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
     serde_json::to_writer_pretty(file, coverage)
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
@@ -591,7 +591,10 @@ mod tests {
         fix_dex_directory(dir.path()).unwrap();
 
         let missed_path = dir.path().join("final").join(format!("{base}_missed.json"));
-        assert!(!missed_path.exists(), "no missed.json should be written at 100% coverage");
+        assert!(
+            !missed_path.exists(),
+            "no missed.json should be written at 100% coverage"
+        );
     }
 
     #[test]
