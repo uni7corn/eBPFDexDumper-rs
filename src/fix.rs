@@ -433,8 +433,7 @@ mod tests {
         // No JSON at root → fix must treat the DEX as unchanged.
         fix_dex_directory(dir.path()).unwrap();
 
-        let final_bytes =
-            fs::read(dir.path().join("final").join(format!("{base}.dex"))).unwrap();
+        let final_bytes = fs::read(dir.path().join("final").join(format!("{base}.dex"))).unwrap();
         // The original DEX bytecode region is zero; if the stale JSON had
         // been picked up, bytes at 0xa0..0xa4 would be 0xde 0xad 0xbe 0xef.
         assert_eq!(&final_bytes[0xa0..0xa4], &[0, 0, 0, 0]);

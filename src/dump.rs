@@ -606,9 +606,11 @@ mod imp {
                     continue;
                 }
                 let size = sizes.get(&begin).copied().or_else(|| {
-                    self.dex_cache.read().unwrap().get(&begin).and_then(|dex| {
-                        DexParser::new(dex).ok().map(|p| p.header().file_size)
-                    })
+                    self.dex_cache
+                        .read()
+                        .unwrap()
+                        .get(&begin)
+                        .and_then(|dex| DexParser::new(dex).ok().map(|p| p.header().file_size))
                 });
                 // Without a real size we'd write `dex_<begin>_0_code.json`
                 // and the fix stage would never find a matching DEX, which

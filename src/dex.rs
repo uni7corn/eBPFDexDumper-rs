@@ -332,10 +332,12 @@ fn decode_mutf8(bytes: &[u8]) -> String {
                 i += 1;
                 continue;
             }
-            let cu1 = (u32::from(b0 & 0x0F) << 12)
-                | (u32::from(b1 & 0x3F) << 6)
-                | u32::from(b2 & 0x3F);
-            if (0xD800..=0xDBFF).contains(&cu1) && i + 6 <= bytes.len() && bytes[i + 3] & 0xF0 == 0xE0 {
+            let cu1 =
+                (u32::from(b0 & 0x0F) << 12) | (u32::from(b1 & 0x3F) << 6) | u32::from(b2 & 0x3F);
+            if (0xD800..=0xDBFF).contains(&cu1)
+                && i + 6 <= bytes.len()
+                && bytes[i + 3] & 0xF0 == 0xE0
+            {
                 let b3 = bytes[i + 3];
                 let b4 = bytes[i + 4];
                 let b5 = bytes[i + 5];

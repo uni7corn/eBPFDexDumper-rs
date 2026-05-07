@@ -25,11 +25,8 @@ pub fn package_name_from_pid(pid: u32) -> Option<String> {
     Some(String::from_utf8_lossy(first).into_owned())
 }
 
-/// Strict whitelist for Android package identifiers. Used as a guard before any
-/// path that interpolates the package name into a shell command — anything
-/// outside `[A-Za-z0-9._]` is rejected to prevent injection (the tool runs as
-/// root on-device, so the blast radius of a bad package name reaching `sh -c`
-/// is very high).
+/// Strict whitelist for Android package identifiers before passing package
+/// names to privileged on-device commands.
 pub fn is_valid_android_package_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 255 {
         return false;
@@ -66,13 +63,13 @@ pub fn lookup_uid_by_package_name(pkg: &str) -> Result<u32> {
         }
     }
 
-    if let Ok(output) = run_shell("cmd package list packages -U") {
+    if let Ok(output) = run_command("cmd", &["package", "list", "packages", "-U"]) {
         if let Some(uid) = parse_cmd_package_list_for_pkg(&output, pkg) {
             return Ok(uid);
         }
     }
 
-    if let Ok(output) = run_shell(&format!("dumpsys package {pkg} | grep -m1 userId=")) {
+    if let Ok(output) = run_command("dumpsys", &["package", pkg]) {
         if let Some(uid) = parse_dumpsys_user_id(&output) {
             return Ok(uid);
         }
@@ -89,7 +86,7 @@ pub fn lookup_packages_by_uid(uid: u32) -> Result<Vec<String>> {
         }
     }
 
-    if let Ok(output) = run_shell("cmd package list packages -U") {
+    if let Ok(output) = run_command("cmd", &["package", "list", "packages", "-U"]) {
         let packages = parse_cmd_package_list_for_uid(&output, uid);
         if !packages.is_empty() {
             return Ok(packages);
@@ -149,8 +146,8 @@ fn pm_paths_for_package(pkg: &str) -> Result<Vec<PathBuf>> {
     if !is_valid_android_package_name(pkg) {
         anyhow::bail!("rejecting suspicious package name: {pkg:?}");
     }
-    let output = run_shell(&format!("pm path {pkg}"))
-        .with_context(|| format!("pm path failed for {pkg}"))?;
+    let output =
+        run_command("pm", &["path", pkg]).with_context(|| format!("pm path failed for {pkg}"))?;
     let paths: Vec<PathBuf> = output
         .lines()
         .filter_map(|line| line.trim().strip_prefix("package:"))
@@ -164,19 +161,26 @@ fn pm_paths_for_package(pkg: &str) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn run_shell(script: &str) -> Result<String> {
-    let output = Command::new("/system/bin/sh")
-        .arg("-c")
-        .arg(script)
+fn run_command(program: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new(program)
+        .args(args)
         .output()
-        .with_context(|| format!("failed to run shell command: {script}"))?;
+        .with_context(|| format!("failed to run command: {}", command_display(program, args)))?;
     if !output.status.success() {
         anyhow::bail!(
-            "shell command failed ({script}): {}",
+            "command failed ({}): {}",
+            command_display(program, args),
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn command_display(program: &str, args: &[&str]) -> String {
+    std::iter::once(program)
+        .chain(args.iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn parse_packages_list_for_pkg(contents: &str, pkg: &str) -> Option<u32> {
