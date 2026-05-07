@@ -139,6 +139,13 @@ struct FixArgs {
     /// Directory containing dumped DEX files.
     #[arg(short, long)]
     dir: PathBuf,
+
+    /// Apply method bytecode even when its length does not match the DEX
+    /// header's `insns_size` (truncating or zero-padding to fit). Off by
+    /// default — mismatches usually indicate stale headers and writing back
+    /// can corrupt the bytecode stream.
+    #[arg(long)]
+    force_mismatch: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -185,7 +192,12 @@ fn main() -> Result<()> {
             println!();
             Ok(())
         }
-        Some(Command::Fix(args)) => fix::fix_dex_directory(&args.dir),
+        Some(Command::Fix(args)) => fix::fix_dex_directory_with(
+            &args.dir,
+            fix::FixOptions {
+                force_mismatch: args.force_mismatch,
+            },
+        ),
         Some(Command::Offsets(args)) => {
             let targets = if args.json {
                 art::find_art_offsets_quiet(&args.libart, args.execute_offset, args.nterp_offset)

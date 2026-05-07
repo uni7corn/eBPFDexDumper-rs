@@ -25,6 +25,22 @@ pub fn package_name_from_pid(pid: u32) -> Option<String> {
     Some(String::from_utf8_lossy(first).into_owned())
 }
 
+/// Strict whitelist for Android package identifiers. Used as a guard before any
+/// path that interpolates the package name into a shell command — anything
+/// outside `[A-Za-z0-9._]` is rejected to prevent injection (the tool runs as
+/// root on-device, so the blast radius of a bad package name reaching `sh -c`
+/// is very high).
+pub fn is_valid_android_package_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 255 {
+        return false;
+    }
+    if name.starts_with('.') || name.ends_with('.') || name.contains("..") {
+        return false;
+    }
+    name.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+}
+
 pub fn sanitize_path_component(name: &str) -> String {
     let mut out: String = name
         .chars()
@@ -40,6 +56,10 @@ pub fn sanitize_path_component(name: &str) -> String {
 }
 
 pub fn lookup_uid_by_package_name(pkg: &str) -> Result<u32> {
+    if !is_valid_android_package_name(pkg) {
+        anyhow::bail!("rejecting suspicious package name: {pkg:?}");
+    }
+
     if let Ok(contents) = fs::read_to_string("/data/system/packages.list") {
         if let Some(uid) = parse_packages_list_for_pkg(&contents, pkg) {
             return Ok(uid);
@@ -80,6 +100,10 @@ pub fn lookup_packages_by_uid(uid: u32) -> Result<Vec<String>> {
 }
 
 pub fn remove_oat_dirs_for_package(pkg: &str) {
+    if !is_valid_android_package_name(pkg) {
+        println!("[oat-clean] rejecting suspicious package name: {pkg:?}");
+        return;
+    }
     match pm_paths_for_package(pkg) {
         Ok(paths) => {
             let mut seen = Vec::<PathBuf>::new();
@@ -122,6 +146,9 @@ pub fn remove_oat_dirs_by_uid(uid: u32) {
 }
 
 fn pm_paths_for_package(pkg: &str) -> Result<Vec<PathBuf>> {
+    if !is_valid_android_package_name(pkg) {
+        anyhow::bail!("rejecting suspicious package name: {pkg:?}");
+    }
     let output = run_shell(&format!("pm path {pkg}"))
         .with_context(|| format!("pm path failed for {pkg}"))?;
     let paths: Vec<PathBuf> = output
@@ -263,5 +290,28 @@ mod tests {
     fn parses_dumpsys_user_id() {
         assert_eq!(parse_dumpsys_user_id("  userId=10342\n"), Some(10342));
         assert_eq!(parse_dumpsys_user_id("missing"), None);
+    }
+
+    #[test]
+    fn package_name_validator_accepts_real_apps() {
+        assert!(is_valid_android_package_name("com.example.app"));
+        assert!(is_valid_android_package_name("com.example.app2"));
+        assert!(is_valid_android_package_name("a"));
+        assert!(is_valid_android_package_name("Foo_bar.Baz"));
+    }
+
+    #[test]
+    fn package_name_validator_rejects_shell_metacharacters() {
+        assert!(!is_valid_android_package_name(""));
+        assert!(!is_valid_android_package_name("com.example.app;rm -rf /"));
+        assert!(!is_valid_android_package_name("com.example`whoami`"));
+        assert!(!is_valid_android_package_name("com.example$(whoami)"));
+        assert!(!is_valid_android_package_name("com.example|cat"));
+        assert!(!is_valid_android_package_name("com.example&"));
+        assert!(!is_valid_android_package_name("com.example app"));
+        assert!(!is_valid_android_package_name(".com.example"));
+        assert!(!is_valid_android_package_name("com.example."));
+        assert!(!is_valid_android_package_name("com..example"));
+        assert!(!is_valid_android_package_name("com.example.app\n"));
     }
 }

@@ -368,12 +368,17 @@ u32 read_method_bytecode(u64 art_method_ptr, u32 *codeitem_size) {
         *codeitem_size = bytes_to_read;
     }
     
+    // Re-clamp via inline asm so the verifier sees a hard upper bound on the
+    // register actually used in bpf_probe_read_user. Using "+r" (input/output)
+    // is required so the C variable picks up the clamped register; an input-
+    // only "r" leaves bytes_to_read unchanged at the C level and the verifier
+    // can lose the bound after the C-side compare above.
     asm volatile("if %[size] < %[max] goto +1;\n"
     "%[size] = %[max];\n"
-    :
-    : [size] "r"(bytes_to_read), [max] "i"(MAX_PERCPU_BUFSIZE - sizeof(struct method_event_data_t)));
+    : [size] "+r"(bytes_to_read)
+    : [max] "i"(MAX_PERCPU_BUFSIZE - sizeof(struct method_event_data_t)));
 
-    if (bpf_probe_read_user(buf->buf + sizeof(struct method_event_data_t), bytes_to_read, 
+    if (bpf_probe_read_user(buf->buf + sizeof(struct method_event_data_t), bytes_to_read,
 	                            (void *)(code_item_ptr + layout->code_item_insns_offset)) != 0) {
         *codeitem_size = 0;
         return 0;
@@ -406,10 +411,14 @@ void submit_method_event_with_bytecode(u64 begin, u32 pid, u32 size, u64 art_met
         method_evt->codeitem_size = codeitem_size;
         
         u32 total_size = sizeof(struct method_event_data_t) + codeitem_size;
+        // Use "+r" so total_size actually picks up the clamped register —
+        // matches the bpf_probe_read_user clamp idiom used elsewhere in this
+        // file. An input-only "r" would let the verifier (and the next read)
+        // see the original, possibly unbounded value.
         asm volatile("if %[size] < %[max] goto +1;\n"
         "%[size] = %[max];\n"
-        :
-        : [size] "r"(total_size), [max] "i"(MAX_PERCPU_BUFSIZE));
+        : [size] "+r"(total_size)
+        : [max] "i"(MAX_PERCPU_BUFSIZE));
         bpf_ringbuf_output(&method_events, buf->buf, total_size, BPF_RB_FORCE_WAKEUP);
     } else {
         // Submit without bytecode using fixed-size structure

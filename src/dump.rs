@@ -185,8 +185,45 @@ mod imp {
     #[derive(Clone, Debug)]
     struct DexRecvState {
         total: u32,
-        recv: u32,
+        /// Sorted, non-overlapping half-open intervals `[start, end)` of bytes
+        /// that have actually been received. We track real coverage instead of
+        /// just `max(end)` so a tail chunk arriving without earlier ones can't
+        /// be misread as completion.
+        intervals: Vec<(u32, u32)>,
         buf: Vec<u8>,
+    }
+
+    impl DexRecvState {
+        fn record(&mut self, start: u32, end: u32) {
+            if start >= end {
+                return;
+            }
+            // Pass-through entries that end before `start` (no overlap, no
+            // adjacency on the left).
+            let mut merged = Vec::with_capacity(self.intervals.len() + 1);
+            let mut new = (start, end);
+            let mut i = 0;
+            while i < self.intervals.len() && self.intervals[i].1 < new.0 {
+                merged.push(self.intervals[i]);
+                i += 1;
+            }
+            // Coalesce everything that overlaps or is adjacent to `new`.
+            while i < self.intervals.len() && self.intervals[i].0 <= new.1 {
+                new.0 = new.0.min(self.intervals[i].0);
+                new.1 = new.1.max(self.intervals[i].1);
+                i += 1;
+            }
+            merged.push(new);
+            while i < self.intervals.len() {
+                merged.push(self.intervals[i]);
+                i += 1;
+            }
+            self.intervals = merged;
+        }
+
+        fn is_complete(&self) -> bool {
+            matches!(self.intervals.as_slice(), [(0, end)] if *end >= self.total)
+        }
     }
 
     impl DumpState {
@@ -262,7 +299,7 @@ mod imp {
                     self.dex_sizes.write().unwrap().insert(hdr.begin, hdr.size);
                     DexRecvState {
                         total: hdr.size,
-                        recv: 0,
+                        intervals: Vec::new(),
                         buf: vec![0; hdr.size as usize],
                     }
                 });
@@ -270,12 +307,10 @@ mod imp {
                 let end = hdr.offset.saturating_add(hdr.data_len);
                 if end as usize <= state.buf.len() {
                     state.buf[hdr.offset as usize..end as usize].copy_from_slice(payload);
-                    if state.recv < end {
-                        state.recv = end;
-                    }
+                    state.record(hdr.offset, end);
                 }
 
-                if state.recv >= state.total {
+                if state.is_complete() {
                     pending
                         .remove(&hdr.begin)
                         .map(|state| (hdr.begin, hdr.size, state.buf))
@@ -570,16 +605,23 @@ mod imp {
                 if records.is_empty() {
                     continue;
                 }
-                let size =
-                    sizes
-                        .get(&begin)
-                        .copied()
-                        .or_else(|| {
-                            self.dex_cache.read().unwrap().get(&begin).and_then(|dex| {
-                                DexParser::new(dex).ok().map(|p| p.header().file_size)
-                            })
-                        })
-                        .unwrap_or(0);
+                let size = sizes.get(&begin).copied().or_else(|| {
+                    self.dex_cache.read().unwrap().get(&begin).and_then(|dex| {
+                        DexParser::new(dex).ok().map(|p| p.header().file_size)
+                    })
+                });
+                // Without a real size we'd write `dex_<begin>_0_code.json`
+                // and the fix stage would never find a matching DEX, which
+                // both pollutes the output dir and is misleading. Skip these
+                // — they only happen when method events arrived but the DEX
+                // body was never captured.
+                let Some(size) = size else {
+                    eprintln!(
+                        "[!] flush_json: skipping dex_{begin:x} ({} records) — no DEX body captured",
+                        records.len()
+                    );
+                    continue;
+                };
                 let file_name = self
                     .output_dir
                     .join(format!("dex_{begin:x}_{size:x}_code.json"));
@@ -1757,6 +1799,66 @@ mod imp {
         Some(u64::from_le_bytes(
             data.get(offset..offset + 8)?.try_into().ok()?,
         ))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::DexRecvState;
+
+        fn empty_state(total: u32) -> DexRecvState {
+            DexRecvState {
+                total,
+                intervals: Vec::new(),
+                buf: vec![0; total as usize],
+            }
+        }
+
+        #[test]
+        fn merges_adjacent_intervals_in_order() {
+            let mut s = empty_state(100);
+            s.record(0, 30);
+            s.record(30, 60);
+            s.record(60, 100);
+            assert_eq!(s.intervals, vec![(0, 100)]);
+            assert!(s.is_complete());
+        }
+
+        #[test]
+        fn out_of_order_chunks_keep_gaps_and_block_completion() {
+            let mut s = empty_state(100);
+            s.record(60, 100);
+            // A tail-only state must NOT be considered complete just because
+            // recv == total — that was the old max-only bug.
+            assert_eq!(s.intervals, vec![(60, 100)]);
+            assert!(!s.is_complete());
+
+            s.record(0, 30);
+            assert_eq!(s.intervals, vec![(0, 30), (60, 100)]);
+            assert!(!s.is_complete());
+
+            s.record(30, 60);
+            assert_eq!(s.intervals, vec![(0, 100)]);
+            assert!(s.is_complete());
+        }
+
+        #[test]
+        fn overlapping_chunks_are_coalesced() {
+            let mut s = empty_state(100);
+            s.record(10, 50);
+            s.record(40, 80);
+            s.record(0, 20);
+            s.record(70, 100);
+            assert_eq!(s.intervals, vec![(0, 100)]);
+            assert!(s.is_complete());
+        }
+
+        #[test]
+        fn empty_intervals_ignored() {
+            let mut s = empty_state(50);
+            s.record(10, 10);
+            assert!(s.intervals.is_empty());
+            assert!(!s.is_complete());
+        }
     }
 }
 

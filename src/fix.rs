@@ -21,7 +21,21 @@ pub struct FixStats {
     pub length_mismatch: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FixOptions {
+    /// If true, accept records whose hex-decoded length differs from the DEX
+    /// header's `insns_size * 2`. The mismatched bytes are truncated or
+    /// zero-padded — semantically dangerous but useful when the DEX header is
+    /// known stale. Off by default because padding can corrupt the bytecode
+    /// stream / payload alignment.
+    pub force_mismatch: bool,
+}
+
 pub fn fix_dex_directory(output_dir: &Path) -> Result<()> {
+    fix_dex_directory_with(output_dir, FixOptions::default())
+}
+
+pub fn fix_dex_directory_with(output_dir: &Path, options: FixOptions) -> Result<()> {
     let pairs = find_pairs(output_dir)?;
     let dex_files = find_root_dex_files(output_dir)?;
     if dex_files.is_empty() {
@@ -44,7 +58,7 @@ pub fn fix_dex_directory(output_dir: &Path) -> Result<()> {
         match pairs.get(&base) {
             Some(json_path) => {
                 let out_path = fix_dir.join(format!("{base}_fix.dex"));
-                match fix_one_dex(&dex_path, json_path, &out_path) {
+                match fix_one_dex(&dex_path, json_path, &out_path, options) {
                     Ok(stats) => {
                         println!(
                             "Applied: {}, Skipped: {}, LengthMismatch: {} for {}",
@@ -74,10 +88,15 @@ pub fn fix_dex_directory(output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn fix_one_dex(dex_path: &Path, json_path: &Path, out_path: &Path) -> Result<FixStats> {
+pub fn fix_one_dex(
+    dex_path: &Path,
+    json_path: &Path,
+    out_path: &Path,
+    options: FixOptions,
+) -> Result<FixStats> {
     let mut dex_bytes =
         fs::read(dex_path).with_context(|| format!("failed to read {}", dex_path.display()))?;
-    let stats = fix_one_dex_bytes_from_json_file(&mut dex_bytes, json_path)?;
+    let stats = fix_one_dex_bytes_from_json_file(&mut dex_bytes, json_path, options)?;
     fs::write(out_path, &dex_bytes)
         .with_context(|| format!("failed to write {}", out_path.display()))?;
     Ok(stats)
@@ -86,11 +105,12 @@ pub fn fix_one_dex(dex_path: &Path, json_path: &Path, out_path: &Path) -> Result
 pub fn fix_one_dex_bytes_from_json_file(
     dex_bytes: &mut [u8],
     json_path: &Path,
+    options: FixOptions,
 ) -> Result<FixStats> {
     let parser = DexParser::new(dex_bytes)?;
     let method2off = build_method_code_off_map(&parser)?;
     let records = read_records(json_path)?;
-    let stats = apply_records_to_dex(dex_bytes, &method2off, &records)?;
+    let stats = apply_records_to_dex(dex_bytes, &method2off, &records, options)?;
     recalc_dex_header(dex_bytes);
     Ok(stats)
 }
@@ -99,6 +119,7 @@ pub fn apply_records_to_dex(
     dex_bytes: &mut [u8],
     method2off: &HashMap<u32, u32>,
     records: &[MethodCodeRecord],
+    options: FixOptions,
 ) -> Result<FixStats> {
     let mut stats = FixStats::default();
     for record in records {
@@ -121,16 +142,20 @@ pub fn apply_records_to_dex(
                 continue;
             }
         };
-        let write_len = expected_len.min(code_bytes.len());
         let insns_start = code_off + 0x10;
         let insns_end = insns_start.saturating_add(expected_len);
         if insns_end > dex_bytes.len() {
             stats.skipped += 1;
             continue;
         }
-        if write_len != code_bytes.len() || write_len != expected_len {
+        if code_bytes.len() != expected_len {
             stats.length_mismatch += 1;
+            if !options.force_mismatch {
+                stats.skipped += 1;
+                continue;
+            }
         }
+        let write_len = expected_len.min(code_bytes.len());
         dex_bytes[insns_start..insns_start + write_len].copy_from_slice(&code_bytes[..write_len]);
         if write_len < expected_len {
             dex_bytes[insns_start + write_len..insns_end].fill(0);
@@ -202,8 +227,24 @@ fn read_records(json_path: &Path) -> Result<Vec<MethodCodeRecord>> {
 }
 
 fn find_pairs(output_dir: &Path) -> Result<HashMap<String, PathBuf>> {
+    // JSON sidecars are written at the root of the output dir. Scanning only
+    // the top level (matching find_root_dex_files) keeps us from re-ingesting
+    // historical artefacts in fix/ / final/ / native_elf/ etc. on a second
+    // run.
     let mut pairs = HashMap::new();
-    collect_pairs(output_dir, &mut pairs)?;
+    for entry in fs::read_dir(output_dir)
+        .with_context(|| format!("failed to read {}", output_dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(base) = dex_code_json_base(&name) {
+            pairs.insert(base, entry.path());
+        }
+    }
     Ok(pairs)
 }
 
@@ -223,26 +264,6 @@ fn find_root_dex_files(output_dir: &Path) -> Result<HashMap<String, PathBuf>> {
         }
     }
     Ok(dex_files)
-}
-
-fn collect_pairs(dir: &Path, pairs: &mut HashMap<String, PathBuf>) -> Result<()> {
-    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            collect_pairs(&entry.path(), pairs)?;
-            continue;
-        }
-        if !file_type.is_file() {
-            continue;
-        }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if let Some(base) = dex_code_json_base(&name) {
-            pairs.insert(base, entry.path());
-        }
-    }
-    Ok(())
 }
 
 fn dex_code_json_base(name: &str) -> Option<String> {
@@ -390,6 +411,36 @@ mod tests {
     }
 
     #[test]
+    fn fix_ignores_json_in_derived_subdirs() {
+        // Re-running fix against an output dir that already has fix/ and
+        // final/ subdirs from a previous pass must not re-ingest the JSON
+        // sidecars from those subdirs.
+        let dir = tempfile::tempdir().unwrap();
+        let base = "dex_3000_b0";
+
+        let dex_path = dir.path().join(format!("{base}.dex"));
+        fs::write(&dex_path, minimal_dex_with_code_item()).unwrap();
+
+        // Stale JSON nested under fix/ that must be ignored.
+        let stale_dir = dir.path().join("fix");
+        fs::create_dir_all(&stale_dir).unwrap();
+        fs::write(
+            stale_dir.join(format!("{base}_code.json")),
+            r#"[{"name":"void Lx;.m()","method_idx":0,"code":"deadbeef"}]"#,
+        )
+        .unwrap();
+
+        // No JSON at root → fix must treat the DEX as unchanged.
+        fix_dex_directory(dir.path()).unwrap();
+
+        let final_bytes =
+            fs::read(dir.path().join("final").join(format!("{base}.dex"))).unwrap();
+        // The original DEX bytecode region is zero; if the stale JSON had
+        // been picked up, bytes at 0xa0..0xa4 would be 0xde 0xad 0xbe 0xef.
+        assert_eq!(&final_bytes[0xa0..0xa4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
     fn applies_code_record_and_recalculates_header() {
         let mut dex = minimal_dex_with_code_item();
         let parser = DexParser::new(&dex).unwrap();
@@ -401,7 +452,7 @@ mod tests {
             method_idx: 0,
             code: "01020304".to_string(),
         }];
-        let stats = apply_records_to_dex(&mut dex, &map, &records).unwrap();
+        let stats = apply_records_to_dex(&mut dex, &map, &records, FixOptions::default()).unwrap();
         assert_eq!(
             stats,
             FixStats {
@@ -415,6 +466,58 @@ mod tests {
         recalc_dex_header(&mut dex);
         assert_ne!(&dex[12..32], &[0u8; 20]);
         assert_ne!(&dex[8..12], &[0u8; 4]);
+    }
+
+    #[test]
+    fn length_mismatch_skipped_by_default() {
+        let mut dex = minimal_dex_with_code_item();
+        let parser = DexParser::new(&dex).unwrap();
+        let map = build_method_code_off_map(&parser).unwrap();
+
+        // Record carries 6 bytes but code_item.insns_size says 2 units = 4 bytes.
+        let records = vec![MethodCodeRecord {
+            name: "void Lx;.m()".to_string(),
+            method_idx: 0,
+            code: "010203040506".to_string(),
+        }];
+        let stats = apply_records_to_dex(&mut dex, &map, &records, FixOptions::default()).unwrap();
+        assert_eq!(
+            stats,
+            FixStats {
+                applied: 0,
+                skipped: 1,
+                length_mismatch: 1
+            }
+        );
+        // The bytecode region should be untouched (still zero from the fixture).
+        assert_eq!(&dex[0xa0..0xa4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn length_mismatch_applied_with_force_flag() {
+        let mut dex = minimal_dex_with_code_item();
+        let parser = DexParser::new(&dex).unwrap();
+        let map = build_method_code_off_map(&parser).unwrap();
+
+        let records = vec![MethodCodeRecord {
+            name: "void Lx;.m()".to_string(),
+            method_idx: 0,
+            code: "010203040506".to_string(),
+        }];
+        let opts = FixOptions {
+            force_mismatch: true,
+        };
+        let stats = apply_records_to_dex(&mut dex, &map, &records, opts).unwrap();
+        assert_eq!(
+            stats,
+            FixStats {
+                applied: 1,
+                skipped: 0,
+                length_mismatch: 1
+            }
+        );
+        // 4 bytes were written (truncated to expected_len).
+        assert_eq!(&dex[0xa0..0xa4], &[1, 2, 3, 4]);
     }
 
     fn minimal_dex_with_code_item() -> Vec<u8> {

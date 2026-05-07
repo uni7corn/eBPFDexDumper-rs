@@ -180,17 +180,20 @@ impl<'a> DexParser<'a> {
             return Err(DexError::OutOfBounds("string data"));
         }
 
-        let (utf16_len, new_pos) = read_uleb128(self.data, pos)?;
+        // string_data_item: ULEB128 utf16_size then MUTF-8 bytes terminated by 0x00.
+        // utf16_size counts UTF-16 code units (not bytes) so we can't use it for slicing.
+        let (_utf16_len, new_pos) = read_uleb128(self.data, pos)?;
         pos = new_pos;
 
-        let end = pos
-            .checked_add(utf16_len as usize)
-            .ok_or(DexError::OutOfBounds("string data"))?;
-        let bytes = self
+        let tail = self
             .data
-            .get(pos..end)
+            .get(pos..)
             .ok_or(DexError::OutOfBounds("string data"))?;
-        Ok(String::from_utf8_lossy(bytes).into_owned())
+        let nul_off = tail
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or(DexError::OutOfBounds("string data"))?;
+        Ok(decode_mutf8(&tail[..nul_off]))
     }
 
     fn get_parameter_types(&self, offset: u32) -> Result<Vec<String>, DexError> {
@@ -280,6 +283,86 @@ impl fmt::Display for MethodInfo {
     }
 }
 
+/// Decode Modified UTF-8 (DEX / Java) into a Rust `String`.
+///
+/// MUTF-8 differs from standard UTF-8 in two places:
+/// - U+0000 is encoded as the two-byte sequence `C0 80` (so a real NUL byte
+///   never appears inside the data and can be used as terminator).
+/// - Code points >= U+10000 are encoded as a UTF-16 surrogate pair, with each
+///   surrogate written as a separate three-byte sequence (six bytes total),
+///   instead of a four-byte UTF-8 sequence.
+///
+/// Malformed sequences are replaced with U+FFFD to match the original
+/// `from_utf8_lossy` behaviour.
+fn decode_mutf8(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b0 = bytes[i];
+        if b0 < 0x80 {
+            out.push(b0 as char);
+            i += 1;
+            continue;
+        }
+        if b0 & 0xE0 == 0xC0 {
+            if i + 2 > bytes.len() {
+                out.push('\u{FFFD}');
+                break;
+            }
+            let b1 = bytes[i + 1];
+            if b1 & 0xC0 != 0x80 {
+                out.push('\u{FFFD}');
+                i += 1;
+                continue;
+            }
+            let cp = (u32::from(b0 & 0x1F) << 6) | u32::from(b1 & 0x3F);
+            out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+            i += 2;
+            continue;
+        }
+        if b0 & 0xF0 == 0xE0 {
+            if i + 3 > bytes.len() {
+                out.push('\u{FFFD}');
+                break;
+            }
+            let b1 = bytes[i + 1];
+            let b2 = bytes[i + 2];
+            if b1 & 0xC0 != 0x80 || b2 & 0xC0 != 0x80 {
+                out.push('\u{FFFD}');
+                i += 1;
+                continue;
+            }
+            let cu1 = (u32::from(b0 & 0x0F) << 12)
+                | (u32::from(b1 & 0x3F) << 6)
+                | u32::from(b2 & 0x3F);
+            if (0xD800..=0xDBFF).contains(&cu1) && i + 6 <= bytes.len() && bytes[i + 3] & 0xF0 == 0xE0 {
+                let b3 = bytes[i + 3];
+                let b4 = bytes[i + 4];
+                let b5 = bytes[i + 5];
+                if b4 & 0xC0 == 0x80 && b5 & 0xC0 == 0x80 {
+                    let cu2 = (u32::from(b3 & 0x0F) << 12)
+                        | (u32::from(b4 & 0x3F) << 6)
+                        | u32::from(b5 & 0x3F);
+                    if (0xDC00..=0xDFFF).contains(&cu2) {
+                        let cp = 0x10000 + (((cu1 - 0xD800) << 10) | (cu2 - 0xDC00));
+                        if let Some(c) = char::from_u32(cp) {
+                            out.push(c);
+                            i += 6;
+                            continue;
+                        }
+                    }
+                }
+            }
+            out.push(char::from_u32(cu1).unwrap_or('\u{FFFD}'));
+            i += 3;
+            continue;
+        }
+        out.push('\u{FFFD}');
+        i += 1;
+    }
+    out
+}
+
 pub fn read_uleb128(data: &[u8], mut pos: usize) -> Result<(u32, usize), DexError> {
     let mut result = 0u32;
     let mut shift = 0u32;
@@ -358,6 +441,40 @@ mod tests {
         assert_eq!(format_type("I"), "int");
         assert_eq!(format_type("[[I"), "int[][]");
         assert_eq!(format_type("Ljava/lang/String;"), "java.lang.String");
+    }
+
+    #[test]
+    fn mutf8_decodes_ascii_and_bmp() {
+        // ASCII fast path.
+        assert_eq!(decode_mutf8(b"hello"), "hello");
+        // 2-byte sequence: U+00E9 'é' = C3 A9.
+        assert_eq!(decode_mutf8(&[0xC3, 0xA9]), "é");
+        // 3-byte sequence: U+4E2D '中' = E4 B8 AD.
+        assert_eq!(decode_mutf8(&[0xE4, 0xB8, 0xAD]), "中");
+    }
+
+    #[test]
+    fn mutf8_decodes_embedded_nul_pair() {
+        // MUTF-8 encodes U+0000 as C0 80, which must round-trip to '\0'.
+        assert_eq!(decode_mutf8(&[b'a', 0xC0, 0x80, b'b']), "a\u{0000}b");
+    }
+
+    #[test]
+    fn mutf8_decodes_surrogate_pair() {
+        // U+1F600 grinning face. UTF-16: D83D DE00.
+        // MUTF-8: ED A0 BD ED B8 80.
+        let bytes = [0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80];
+        assert_eq!(decode_mutf8(&bytes), "\u{1F600}");
+    }
+
+    #[test]
+    fn mutf8_replaces_malformed_with_fffd() {
+        // Lone high surrogate (no low surrogate following) decodes to U+FFFD.
+        assert_eq!(decode_mutf8(&[0xED, 0xA0, 0xBD]), "\u{FFFD}");
+        // Truncated 2-byte sequence.
+        assert_eq!(decode_mutf8(&[0xC3]), "\u{FFFD}");
+        // Stray continuation byte.
+        assert_eq!(decode_mutf8(&[b'a', 0x80, b'b']), "a\u{FFFD}b");
     }
 
     #[test]
