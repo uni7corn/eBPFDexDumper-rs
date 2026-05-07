@@ -48,12 +48,13 @@ su -c './eBPFDexDumper dump -u 10123 -o /data/local/tmp/dex_out'
 su -c './eBPFDexDumper dump -n com.example.app --probe-mode lifecycle'
 su -c './eBPFDexDumper dump -n com.example.app --native-elf-scan'
 
-./eBPFDexDumper fix -d /data/local/tmp/dex_out
+./eBPFDexDumper fix -d /data/local/tmp/dex_out/com.example.app
+./eBPFDexDumper fix -d /data/local/tmp/dex_out/com.example.app --force-mismatch
 ./eBPFDexDumper offsets -l /apex/com.android.art/lib64/libart.so
 ./eBPFDexDumper offsets -l /apex/com.android.art/lib64/libart.so --json
 ```
 
-Useful options:
+Useful `dump` options:
 
 - `--pid <PID>`: restrict tracing to one process in addition to UID/package filtering.
 - `--no-clean-oat`: do not clean OAT files.
@@ -64,6 +65,10 @@ Useful options:
 - `--probe-mode full|lifecycle|maps-only`: reduce the attached probe set when a target performs uprobe checks.
 - `--libc <PATH>`: set the bionic libc path.
 - `--art-layout <LIST>`: provide ART field offsets manually.
+
+Useful `fix` options:
+
+- `--force-mismatch`: fall back to the legacy "truncate / zero-pad" behaviour when a record's hex-decoded length does not match the DEX header's `insns_size * 2`. Off by default — mismatched records are skipped because padding can corrupt the bytecode stream.
 
 `--art-layout` order:
 
@@ -85,7 +90,15 @@ Outputs under `dist/`:
 
 ## Notes
 
-`dump` runs `fix` on exit by default. The original `dex_*.dex` files remain in the output directory; `fix/` stores repaired copies when bytecode records can be applied; `final/` is the usable result set, preferring repaired DEX files and falling back to original dumps when no matching `_code.json` exists or repair fails.
+`dump` writes everything for one target into a per-target subdirectory under `-o`: `--name` uses the package name (e.g. `com.example.app/`), `--pid`-only falls back to `/proc/<pid>/cmdline` and then `pid_<num>/`, `--uid`-only uses `uid_<num>/`. The subdirectory holds `dex_*.dex` (raw dumps), `dex_*_code.json` (per-method bytecode records), `fix/`, `final/`, plus `native_elf/` when `--native-elf-scan` is enabled.
+
+`dump` runs `fix` on exit by default (use `--no-auto-fix` to disable). The original `dex_*.dex` files always remain. `fix/` stores the repaired DEX for each base; `final/` is the usable result set, preferring the repaired copy and falling back to the original dump when no matching `_code.json` exists or repair fails.
+
+`fix` runs in strict mode by default: a record whose hex-decoded length does not match the DEX header's `insns_size * 2` is skipped instead of being truncated / zero-padded into the bytecode stream. Pass `--force-mismatch` to restore the legacy lossy behaviour.
+
+`fix` also produces a method-bytecode coverage report. The console prints one `Coverage: A/B methods (P%), N missed` line per DEX, where the denominator counts every method with `code_off != 0` (abstract / native methods are excluded). When at least one method is missed, the full list is written to `final/<base>_missed.json` with `method_idx`, `code_off`, and a best-effort pretty signature for each missed method, so you can decide whether to extend the trace window and re-run.
+
+`--clean-oat` is **on by default** and removes the target app's `/data/app/.../oat/` directories before dumping to force ART back into the interpreter. **This is destructive** — pass `--no-clean-oat` to keep them.
 
 The default ART layout targets common Android 13+ layouts. Use `--art-layout` when a ROM uses different offsets. If a target only decrypts fragmented method bodies briefly in native code and never keeps a continuous valid DEX in memory, packer-specific hooks are still required.
 

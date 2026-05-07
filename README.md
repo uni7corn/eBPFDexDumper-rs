@@ -35,21 +35,30 @@ su -c './eBPFDexDumper dump -u 10123 -o /data/local/tmp/dex_out'
 su -c './eBPFDexDumper dump -n com.example.app --probe-mode lifecycle'
 su -c './eBPFDexDumper dump -n com.example.app --native-elf-scan'
 ./eBPFDexDumper fix -d /data/local/tmp/dex_out/com.example.app
+./eBPFDexDumper fix -d /data/local/tmp/dex_out/com.example.app --force-mismatch
 ./eBPFDexDumper offsets -l /apex/com.android.art/lib64/libart.so
 ./eBPFDexDumper offsets -l /apex/com.android.art/lib64/libart.so --json
 ```
 
 ## 说明
 
-`dump` 会在 `-o` 指定的根目录下按目标自动建子目录：`--name` 用包名（如 `com.example.app/`），仅 `--pid` 时用 `/proc/<pid>/cmdline` 推断，回落 `pid_<num>/`，仅 `--uid` 时用 `uid_<num>/`。所有输出（`dex_*.dex`、`dex_*_code.json`、`fix/`、`final/`）都落到这个子目录。
+`dump` 会在 `-o` 指定的根目录下按目标自动建子目录：`--name` 用包名（如 `com.example.app/`），仅 `--pid` 时用 `/proc/<pid>/cmdline` 推断，回落 `pid_<num>/`，仅 `--uid` 时用 `uid_<num>/`。子目录里会落入 `dex_*.dex`（原始 dump）、`dex_*_code.json`（方法字节码记录）、`fix/`、`final/`，开 `--native-elf-scan` 时还有 `native_elf/`。
 
-`dump` 默认会在退出时执行 `fix`。子目录里的原始 `dex_*.dex` 会保留；`fix/` 保存成功回填的方法修复版；`final/` 是最终使用目录，有修复版时优先放修复版，没有对应 `_code.json` 或修复失败时放原始 DEX。
+`dump` 默认会在退出时执行 `fix`（`--no-auto-fix` 关闭）。原始 `dex_*.dex` 始终保留；`fix/` 存放回填后的 DEX；`final/` 是最终使用目录，对每个 base 优先放 `fix/` 里的修复版，缺 `_code.json` 或修复失败时退回原始 DEX。
+
+`fix` 默认严格模式：当 record 的字节长度与 DEX 头里 `insns_size * 2` 不一致时跳过该 record，避免补 0/截断破坏指令流；如需保留旧的截断/补零行为，加 `--force-mismatch`。
+
+`fix` 同时会输出方法覆盖率报告：控制台打印 `Coverage: A/B methods (P%), N missed` 一行，统计 DEX 里所有 `code_off != 0` 的方法（abstract/native 不计）；当存在未抓到的方法时，详细清单写入 `final/<base>_missed.json`，每条含 `method_idx`、`code_off` 和（尽量解析到的）方法签名，便于判断是否需要扩大 trace 窗口再跑一次。
+
+`--clean-oat` 默认开启，会在 dump 前删除目标 app `/data/app/.../oat/` 目录以强制 ART 走解释器。**这是有破坏性的默认行为**（删除会保留到下次 oat 重建），要保留 oat 加 `--no-clean-oat`。
 
 默认 ART layout 按 Android 13+ 常见布局处理；ROM 偏移不一致时使用 `--art-layout`。如果目标只在 native 层短暂解密碎片化方法体，内存中不保留连续合法 DEX，需要按壳适配。
 
 `--probe-mode full|lifecycle|maps-only` 用于按场景收窄探针面：`full` 为默认全量 ART/libc uprobe；`lifecycle` 只保留 DexFile 生命周期探针和 maps 扫描；`maps-only` 不挂 uprobe，只做 `/proc/<pid>/maps` 内存扫描。uprobe 在目标映射上仍可能留下可检测痕迹，强反调试目标可先尝试 `lifecycle` 或 `maps-only`。
 
 `--native-elf-scan` 是实验选项，会复用 libc `mmap`/`mprotect` 事件识别匿名可执行 ARM64 ELF 候选块，并保存到输出子目录的 `native_elf/`。它只作为隐藏 native loader 行为的辅助排查，不影响默认 DEX dump 和回填流程。
+
+完整选项见 `--help`，包括 `-p/--pid`、`-t/--trace`、`--debug-layout`、`--no-code-item-fallback`、`--no-maps-scan`、`--no-native-buffer-scan`、`--libc` 等。
 
 ## 许可证
 
