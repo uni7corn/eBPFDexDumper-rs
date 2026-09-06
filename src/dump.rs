@@ -1,5 +1,45 @@
 use std::path::PathBuf;
 
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+fn drain_until_idle(
+    mut consume_one: impl FnMut() -> bool,
+    mut keep_finalizing: impl FnMut() -> bool,
+) {
+    while keep_finalizing() && consume_one() {}
+}
+
+#[cfg(test)]
+mod finalization_tests {
+    #[test]
+    fn final_drain_consumes_more_than_one_batch() {
+        let mut queued = 5000;
+        super::drain_until_idle(
+            || {
+                if queued == 0 {
+                    return false;
+                }
+                queued -= 1;
+                true
+            },
+            || true,
+        );
+        assert_eq!(queued, 0);
+    }
+
+    #[test]
+    fn final_drain_honors_forced_stop() {
+        let mut consumed = 0;
+        super::drain_until_idle(
+            || {
+                consumed += 1;
+                true
+            },
+            || false,
+        );
+        assert_eq!(consumed, 0);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DumpConfig {
     pub uid: u32,
@@ -146,18 +186,19 @@ mod imp {
         trace: bool,
         native_buffer_scan: bool,
         native_elf_scan: bool,
-        dex_cache: RwLock<HashMap<u64, Vec<u8>>>,
-        dex_hashes: RwLock<HashSet<[u8; 20]>>,
-        native_elf_cache: RwLock<HashSet<u64>>,
-        dex_sizes: RwLock<HashMap<u64, u32>>,
-        pending_dex: RwLock<HashMap<u64, DexRecvState>>,
-        method_records: RwLock<HashMap<u64, Vec<MethodCodeRecord>>>,
-        method_sig_cache: RwLock<HashMap<(u64, u32), String>>,
+        dex_cache: RwLock<HashMap<(u32, u64), Vec<u8>>>,
+        ambiguous_dex: RwLock<HashSet<(u32, u64)>>,
+        native_elf_cache: RwLock<HashSet<(u32, u64)>>,
+        dex_sizes: RwLock<HashMap<(u32, u64), u32>>,
+        pending_dex: RwLock<HashMap<(u32, u64), DexRecvState>>,
+        method_records: RwLock<HashMap<(u32, u64), Vec<MethodCodeRecord>>>,
+        method_sig_cache: RwLock<HashMap<(u32, u64, u32), String>>,
         maps_cache: RwLock<HashMap<u32, MapsRegions>>,
         layout_events_seen: RwLock<HashSet<(u32, u64, u32, u32)>>,
         jni_methods: RwLock<Vec<JniMethod>>,
         /// Native buffer event rate limiter: (count, reset_time)
         native_buffer_budget: std::sync::Mutex<(u32, std::time::Instant)>,
+        captures_sealed: std::sync::Mutex<bool>,
     }
 
     #[derive(Default, Clone, Debug)]
@@ -283,7 +324,7 @@ mod imp {
                 native_buffer_scan,
                 native_elf_scan,
                 dex_cache: RwLock::new(HashMap::new()),
-                dex_hashes: RwLock::new(HashSet::new()),
+                ambiguous_dex: RwLock::new(HashSet::new()),
                 native_elf_cache: RwLock::new(HashSet::new()),
                 dex_sizes: RwLock::new(HashMap::new()),
                 pending_dex: RwLock::new(HashMap::new()),
@@ -293,6 +334,7 @@ mod imp {
                 layout_events_seen: RwLock::new(HashSet::new()),
                 jni_methods: RwLock::new(Vec::new()),
                 native_buffer_budget: std::sync::Mutex::new((200, std::time::Instant::now())),
+                captures_sealed: std::sync::Mutex::new(false),
             }
         }
 
@@ -312,7 +354,7 @@ mod imp {
                 eprintln!("Dex event too short: {} bytes", data.len());
                 return;
             };
-            self.dex_sizes.write().unwrap().insert(evt.begin, evt.size);
+            self.observe_dex(evt.pid, evt.begin, evt.size);
         }
 
         fn handle_dex_chunk(&self, data: &[u8]) {
@@ -320,6 +362,20 @@ mod imp {
                 eprintln!("Dex chunk event too short: {} bytes", data.len());
                 return;
             };
+            if !(DEX_HEADER_SIZE..=MAX_DEX_FILE_SIZE).contains(&hdr.size)
+                || hdr.data_len == 0
+                || hdr
+                    .offset
+                    .checked_add(hdr.data_len)
+                    .is_none_or(|end| end > hdr.size)
+            {
+                return;
+            }
+            let key = (hdr.pid, hdr.begin);
+            self.observe_dex(hdr.pid, hdr.begin, hdr.size);
+            if self.ambiguous_dex.read().unwrap().contains(&key) {
+                return;
+            }
             let payload_start = DEX_CHUNK_HEADER_SIZE;
             let payload_end = payload_start.saturating_add(hdr.data_len as usize);
             let Some(payload) = data.get(payload_start..payload_end) else {
@@ -330,21 +386,39 @@ mod imp {
             // A fallback read may have already assembled this DEX; ignore late
             // chunks so they don't rebuild a pending entry that never
             // re-completes (and leaves a zero-filled hole).
-            if self.dex_cache.read().unwrap().contains_key(&hdr.begin) {
+            let cached_match = self.dex_cache.read().unwrap().get(&key).map(|bytes| {
+                bytes.get(hdr.offset as usize..(hdr.offset + hdr.data_len) as usize)
+                    == Some(payload)
+            });
+            if let Some(matches) = cached_match {
+                if !matches {
+                    self.quarantine_dex(hdr.pid, hdr.begin);
+                }
                 return;
             }
 
             let maybe_complete = {
                 let mut pending = self.pending_dex.write().unwrap();
-                let state = pending.entry(hdr.begin).or_insert_with(|| {
-                    self.dex_sizes.write().unwrap().insert(hdr.begin, hdr.size);
-                    DexRecvState {
-                        total: hdr.size,
-                        intervals: Vec::new(),
-                        buf: vec![0; hdr.size as usize],
-                        last_received: std::time::Instant::now(),
-                    }
+                let state = pending.entry(key).or_insert_with(|| DexRecvState {
+                    total: hdr.size,
+                    intervals: Vec::new(),
+                    buf: vec![0; hdr.size as usize],
+                    last_received: std::time::Instant::now(),
                 });
+
+                let end = hdr.offset + hdr.data_len;
+                let conflicts = state.intervals.iter().any(|&(start, stop)| {
+                    let left = start.max(hdr.offset);
+                    let right = stop.min(end);
+                    left < right
+                        && state.buf[left as usize..right as usize]
+                            != payload[(left - hdr.offset) as usize..(right - hdr.offset) as usize]
+                });
+                if conflicts {
+                    drop(pending);
+                    self.quarantine_dex(hdr.pid, hdr.begin);
+                    return;
+                }
 
                 let end = hdr.offset.saturating_add(hdr.data_len);
                 if end as usize <= state.buf.len() {
@@ -355,7 +429,7 @@ mod imp {
 
                 if state.is_complete() {
                     pending
-                        .remove(&hdr.begin)
+                        .remove(&key)
                         .map(|state| (hdr.begin, hdr.size, state.buf))
                 } else {
                     None
@@ -380,7 +454,16 @@ mod imp {
                 &[]
             };
 
-            let method_name = self.method_name(hdr.begin, hdr.method_index);
+            self.observe_dex(hdr.pid, hdr.begin, hdr.size);
+            if self
+                .ambiguous_dex
+                .read()
+                .unwrap()
+                .contains(&(hdr.pid, hdr.begin))
+            {
+                return;
+            }
+            let method_name = self.method_name(hdr.pid, hdr.begin, hdr.method_index);
 
             if self.trace {
                 if hdr.codeitem_size > 0 {
@@ -410,7 +493,7 @@ mod imp {
                 self.method_records
                     .write()
                     .unwrap()
-                    .entry(hdr.begin)
+                    .entry((hdr.pid, hdr.begin))
                     .or_default()
                     .push(record);
             }
@@ -435,7 +518,18 @@ mod imp {
                 return;
             }
             // The fallback (or a chunk path) may have already assembled it.
-            if self.dex_cache.read().unwrap().contains_key(&begin) {
+            self.observe_dex(evt.pid, begin, evt.size);
+            if self
+                .dex_cache
+                .read()
+                .unwrap()
+                .contains_key(&(evt.pid, begin))
+                || self
+                    .ambiguous_dex
+                    .read()
+                    .unwrap()
+                    .contains(&(evt.pid, begin))
+            {
                 return;
             }
             // Expected path: bpf_probe_read_user can't fault in pages, so any DEX
@@ -485,7 +579,7 @@ mod imp {
                     }
                 }
             }
-            self.pending_dex.write().unwrap().remove(&begin);
+            self.pending_dex.write().unwrap().remove(&(evt.pid, begin));
             self.save_dex(Some(evt.pid), begin, out_size, buf);
         }
 
@@ -611,7 +705,7 @@ mod imp {
         fn save_native_elf(&self, pid: u32, base: u64, size: u64, bytes: Vec<u8>) {
             {
                 let mut cache = self.native_elf_cache.write().unwrap();
-                if !cache.insert(base) {
+                if !cache.insert((pid, base)) {
                     return;
                 }
             }
@@ -630,7 +724,34 @@ mod imp {
             }
         }
 
+        fn observe_dex(&self, pid: u32, begin: u64, size: u32) {
+            if !(DEX_HEADER_SIZE..=MAX_DEX_FILE_SIZE).contains(&size) {
+                self.quarantine_dex(pid, begin);
+                return;
+            }
+            let previous = self.dex_sizes.write().unwrap().insert((pid, begin), size);
+            if previous.is_some_and(|old| old != size) {
+                self.quarantine_dex(pid, begin);
+            }
+        }
+
+        fn quarantine_dex(&self, pid: u32, begin: u64) {
+            if self.ambiguous_dex.write().unwrap().insert((pid, begin)) {
+                eprintln!("[!] DEX identity changed at pid={pid} begin=0x{begin:x}; bytecode association disabled for this address");
+            }
+            self.pending_dex.write().unwrap().remove(&(pid, begin));
+            self.method_records.write().unwrap().remove(&(pid, begin));
+            self.method_sig_cache
+                .write()
+                .unwrap()
+                .retain(|(p, b, _), _| (*p, *b) != (pid, begin));
+        }
+
         fn save_dex(&self, pid: Option<u32>, begin: u64, size: u32, bytes: Vec<u8>) {
+            let sealed = self.captures_sealed.lock().unwrap();
+            if *sealed {
+                return;
+            }
             if let Some(pid) = pid {
                 if let Some(path) = self.should_skip_system(pid, begin, size) {
                     if self.trace {
@@ -656,33 +777,34 @@ mod imp {
                 }
                 return;
             }
-            // Dedup on content before the address cache: a new dex may reuse
-            // the begin address of one that was munmap'ed, and the address
-            // cache must not hide it.
+            let Some(pid) = pid else { return };
+            let key = (pid, begin);
+            self.observe_dex(pid, begin, size);
             let hash = Self::dex_content_hash(&bytes);
-            if !self.dex_hashes.write().unwrap().insert(hash) {
-                if self.trace {
-                    eprintln!(
-                        "Skip duplicate dex 0x{begin:x} ({} bytes, sha1={})",
-                        bytes.len(),
-                        hex::encode(hash)
-                    );
+            let mut cache = self.dex_cache.write().unwrap();
+            if let Some(previous) = cache.get(&key) {
+                if previous == &bytes {
+                    return;
                 }
-                return;
+                self.quarantine_dex(pid, begin);
             }
-            // Drop any half-assembled chunks for this dex; another path
-            // just landed a complete, valid copy.
-            self.pending_dex.write().unwrap().remove(&begin);
-            self.dex_cache.write().unwrap().insert(begin, bytes.clone());
-            self.dex_sizes.write().unwrap().insert(begin, size);
-
-            let file_name = self.output_dir.join(format!("dex_{begin:x}_{size:x}.dex"));
+            let ambiguous = self.ambiguous_dex.read().unwrap().contains(&key);
+            let stem = if ambiguous {
+                format!("dex_{pid:x}_{begin:x}_{}_{size:x}", hex::encode(hash))
+            } else {
+                format!("dex_{pid:x}_{begin:x}_{size:x}")
+            };
+            let file_name = self.output_dir.join(format!("{stem}.dex"));
             match fs::write(&file_name, &bytes) {
-                Ok(()) => println!(
-                    "Dex file saved to {}, size {}",
-                    file_name.display(),
-                    bytes.len()
-                ),
+                Ok(()) => {
+                    self.pending_dex.write().unwrap().remove(&key);
+                    self.method_sig_cache
+                        .write()
+                        .unwrap()
+                        .retain(|(p, b, _), _| (*p, *b) != key);
+                    cache.insert(key, bytes);
+                    println!("Dex file saved to {}, size {}", file_name.display(), size);
+                }
                 Err(err) => eprintln!("Write dexData failed for {}: {err}", file_name.display()),
             }
         }
@@ -761,12 +883,12 @@ mod imp {
             );
         }
 
-        fn method_name(&self, begin: u64, method_idx: u32) -> String {
+        fn method_name(&self, pid: u32, begin: u64, method_idx: u32) -> String {
             if let Some(cached) = self
                 .method_sig_cache
                 .read()
                 .unwrap()
-                .get(&(begin, method_idx))
+                .get(&(pid, begin, method_idx))
                 .cloned()
             {
                 return cached;
@@ -776,7 +898,7 @@ mod imp {
                 .dex_cache
                 .read()
                 .unwrap()
-                .get(&begin)
+                .get(&(pid, begin))
                 .and_then(|dex| DexParser::new(dex).ok())
                 .and_then(|parser| parser.get_method_info(method_idx).ok())
                 .map(|method| method.pretty_method())
@@ -785,26 +907,29 @@ mod imp {
             self.method_sig_cache
                 .write()
                 .unwrap()
-                .insert((begin, method_idx), name.clone());
+                .insert((pid, begin, method_idx), name.clone());
             name
         }
 
         fn flush_json(&self) -> Result<()> {
-            let mut records_by_dex = self.method_records.write().unwrap();
-            let records_by_dex = std::mem::take(&mut *records_by_dex);
+            let records_by_dex = {
+                let mut records = self.method_records.write().unwrap();
+                std::mem::take(&mut *records)
+            };
 
-            let sizes = self.dex_sizes.read().unwrap().clone();
-            for (begin, records) in records_by_dex {
+            for ((pid, begin), records) in records_by_dex {
+                if self.ambiguous_dex.read().unwrap().contains(&(pid, begin)) {
+                    continue;
+                }
                 if records.is_empty() {
                     continue;
                 }
-                let size = sizes.get(&begin).copied().or_else(|| {
-                    self.dex_cache
-                        .read()
-                        .unwrap()
-                        .get(&begin)
-                        .and_then(|dex| DexParser::new(dex).ok().map(|p| p.header().file_size))
-                });
+                let size = self
+                    .dex_cache
+                    .read()
+                    .unwrap()
+                    .get(&(pid, begin))
+                    .map(|dex| dex.len() as u32);
                 // Without a real size we'd write `dex_<begin>_0_code.json`
                 // and the fix stage would never find a matching DEX, which
                 // both pollutes the output dir and is misleading. Skip these
@@ -819,7 +944,7 @@ mod imp {
                 };
                 let file_name = self
                     .output_dir
-                    .join(format!("dex_{begin:x}_{size:x}_code.json"));
+                    .join(format!("dex_{pid:x}_{begin:x}_{size:x}_code.json"));
                 let file = fs::File::create(&file_name)
                     .with_context(|| format!("failed to create {}", file_name.display()))?;
                 serde_json::to_writer_pretty(file, &records)
@@ -837,7 +962,9 @@ mod imp {
             match scan_uid_maps(uid, self.trace) {
                 Ok(found) => {
                     let count = found.len();
-                    self.save_scanned_dexes(None, found);
+                    for (pid, begin, size, bytes) in found {
+                        self.save_dex(Some(pid), begin, size, bytes);
+                    }
                     count
                 }
                 Err(err) => {
@@ -970,16 +1097,15 @@ mod imp {
             state.flush_json()?;
             if config.auto_fix {
                 println!("[+] Auto-fixing DEX files...");
-                if let Err(err) = fix::repair_directory(
+                fix::repair_directory(
                     &config.out,
                     None,
                     fix::FixOptions {
                         force_mismatch: false,
                         dedup: true,
                     },
-                ) {
-                    eprintln!("[!] Auto-fix failed: {err:#}");
-                }
+                )
+                .context("automatic DEX repair failed")?;
             }
             println!("DexDumper stopped");
             return Ok(());
@@ -1234,30 +1360,31 @@ mod imp {
         // growing. Without this, busy ART processes can refill the rings as fast
         // as we drain them, livelocking shutdown.
         drop(ebpf);
-        drain_ring(&mut events, |data| state.handle_dex_event(data));
-        drain_ring(&mut method_events, |data| state.handle_method_event(data));
-        drain_ring(&mut dex_chunks, |data| state.handle_dex_chunk(data));
-        drain_ring(&mut read_failures, |data| state.handle_read_failure(data));
-        drain_ring(&mut layout_debug_events, |data| {
+        drain_final_ring(&mut events, |data| state.handle_dex_event(data));
+        drain_final_ring(&mut method_events, |data| state.handle_method_event(data));
+        drain_final_ring(&mut dex_chunks, |data| state.handle_dex_chunk(data));
+        drain_final_ring(&mut read_failures, |data| state.handle_read_failure(data));
+        drain_final_ring(&mut layout_debug_events, |data| {
             state.handle_layout_debug_event(data)
         });
-        drain_ring(&mut native_buffer_events, |data| {
+        drain_final_ring(&mut native_buffer_events, |data| {
             state.handle_native_buffer_event(data)
         });
+        drain_final_ring(&mut jni_events, |data| state.handle_jni_event(data));
+        *state.captures_sealed.lock().unwrap() = true;
         state.write_jni_symbols();
         state.flush_json()?;
         if config.auto_fix {
             println!("[+] Auto-fixing DEX files... (press Ctrl+C again to skip)");
-            if let Err(err) = fix::repair_directory(
+            fix::repair_directory(
                 &config.out,
                 None,
                 fix::FixOptions {
                     force_mismatch: false,
                     dedup: true,
                 },
-            ) {
-                eprintln!("[!] Auto-fix failed: {err:#}");
-            }
+            )
+            .context("automatic DEX repair failed")?;
         }
         println!("DexDumper stopped");
         Ok(())
@@ -1405,6 +1532,24 @@ mod imp {
 
     const DRAIN_BATCH_LIMIT: usize = 1024;
 
+    fn drain_final_ring<T: std::borrow::Borrow<MapData>, F: FnMut(&[u8])>(
+        ring: &mut RingBuf<T>,
+        mut handler: F,
+    ) {
+        // Producers are detached; drain all backlog unless a second signal
+        // explicitly interrupts finalization.
+        super::drain_until_idle(
+            || {
+                let Some(item) = ring.next() else {
+                    return false;
+                };
+                handler(&item);
+                true
+            },
+            shutdown::keep_finalizing,
+        );
+    }
+
     fn drain_ring<T: std::borrow::Borrow<MapData>, F: FnMut(&[u8])>(
         ring: &mut RingBuf<T>,
         mut handler: F,
@@ -1484,6 +1629,7 @@ mod imp {
     #[derive(Clone, Copy, Debug)]
     struct DexEvent {
         begin: u64,
+        pid: u32,
         size: u32,
     }
 
@@ -1491,6 +1637,7 @@ mod imp {
         fn parse(data: &[u8]) -> Option<Self> {
             Some(Self {
                 begin: le64(data, 0)?,
+                pid: le32(data, 8)?,
                 size: le32(data, 12)?,
             })
         }
@@ -1524,6 +1671,7 @@ mod imp {
     struct MethodEvent {
         begin: u64,
         pid: u32,
+        size: u32,
         art_method_ptr: u64,
         method_index: u32,
         codeitem_size: u32,
@@ -1537,6 +1685,7 @@ mod imp {
             Some(Self {
                 begin: le64(data, 0)?,
                 pid: le32(data, 8)?,
+                size: le32(data, 12)?,
                 art_method_ptr: le64(data, 24)?,
                 method_index: le32(data, 32)?,
                 codeitem_size: le32(data, 36)?,
@@ -1945,14 +2094,18 @@ mod imp {
         Some(file_size)
     }
 
-    fn scan_uid_maps(uid: u32, trace: bool) -> Result<Vec<(u64, u32, Vec<u8>)>> {
+    fn scan_uid_maps(uid: u32, trace: bool) -> Result<Vec<(u32, u64, u32, Vec<u8>)>> {
         let mut found = Vec::new();
         for pid in pids_for_uid(uid)? {
             if !keep_running() {
                 break;
             }
             match scan_process_maps(pid) {
-                Ok(mut dexes) => found.append(&mut dexes),
+                Ok(dexes) => found.extend(
+                    dexes
+                        .into_iter()
+                        .map(|(begin, size, bytes)| (pid, begin, size, bytes)),
+                ),
                 Err(err) => {
                     if trace {
                         eprintln!("maps scan failed for pid {pid}: {err:#}");
@@ -2188,7 +2341,112 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
-        use super::{contiguous_readable_end, DexRecvState, MapRegion, MapsEntry, MapsRegions};
+        use super::*;
+
+        fn test_dex(marker: u8) -> Vec<u8> {
+            let mut bytes = vec![0; DEX_HEADER_SIZE as usize];
+            bytes[..8].copy_from_slice(b"dex\n035\0");
+            bytes[32..36].copy_from_slice(&DEX_HEADER_SIZE.to_le_bytes());
+            bytes[36..40].copy_from_slice(&DEX_HEADER_SIZE.to_le_bytes());
+            bytes[8] = marker;
+            bytes
+        }
+
+        fn method_event(pid: u32) -> Vec<u8> {
+            let mut bytes = vec![0; METHOD_EVENT_HEADER_SIZE + 2];
+            bytes[..8].copy_from_slice(&0x1000u64.to_le_bytes());
+            bytes[8..12].copy_from_slice(&pid.to_le_bytes());
+            bytes[12..16].copy_from_slice(&DEX_HEADER_SIZE.to_le_bytes());
+            bytes[36..40].copy_from_slice(&2u32.to_le_bytes());
+            bytes[METHOD_EVENT_HEADER_SIZE] = 0x0e;
+            bytes
+        }
+
+        fn chunk_event(pid: u32, offset: u32, payload: &[u8]) -> Vec<u8> {
+            let mut bytes = vec![0; DEX_CHUNK_HEADER_SIZE];
+            bytes[..8].copy_from_slice(&0x1000u64.to_le_bytes());
+            bytes[8..12].copy_from_slice(&pid.to_le_bytes());
+            bytes[12..16].copy_from_slice(&DEX_HEADER_SIZE.to_le_bytes());
+            bytes[16..20].copy_from_slice(&offset.to_le_bytes());
+            bytes[20..24].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(payload);
+            bytes
+        }
+
+        #[test]
+        fn same_address_isolated_by_process_through_json_output() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = DumpState::new(dir.path().into(), false, false, false);
+            // Identical contents must still retain both process identities.
+            for pid in [101, 202] {
+                state.save_dex(Some(pid), 0x1000, DEX_HEADER_SIZE, test_dex(1));
+                state.handle_method_event(&method_event(pid));
+            }
+            assert_eq!(state.dex_cache.read().unwrap().len(), 2);
+            state.flush_json().unwrap();
+            for pid in [101, 202] {
+                assert!(dir.path().join(format!("dex_{pid:x}_1000_70.dex")).exists());
+                assert!(dir
+                    .path()
+                    .join(format!("dex_{pid:x}_1000_70_code.json"))
+                    .exists());
+            }
+        }
+
+        #[test]
+        fn interleaved_chunks_do_not_mix_processes() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = DumpState::new(dir.path().into(), false, false, false);
+            let a = test_dex(1);
+            let b = test_dex(2);
+            state.handle_dex_chunk(&chunk_event(101, 0, &a[..56]));
+            state.handle_dex_chunk(&chunk_event(202, 56, &b[56..]));
+            assert_eq!(state.pending_dex.read().unwrap().len(), 2);
+            assert!(state.dex_cache.read().unwrap().is_empty());
+            state.handle_dex_chunk(&chunk_event(202, 0, &b[..56]));
+            state.handle_dex_chunk(&chunk_event(101, 56, &a[56..]));
+            let cache = state.dex_cache.read().unwrap();
+            assert_eq!(cache[&(101, 0x1000)], a);
+            assert_eq!(cache[&(202, 0x1000)], b);
+        }
+
+        #[test]
+        fn changed_content_quarantines_bytecode_without_overwriting_original() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = DumpState::new(dir.path().into(), false, false, false);
+            state.save_dex(Some(101), 0x1000, DEX_HEADER_SIZE, test_dex(1));
+            state.handle_method_event(&method_event(101));
+            state.save_dex(Some(101), 0x1000, DEX_HEADER_SIZE, test_dex(2));
+            state.handle_method_event(&method_event(101));
+            state.flush_json().unwrap();
+            assert!(state.ambiguous_dex.read().unwrap().contains(&(101, 0x1000)));
+            assert!(!dir.path().join("dex_65_1000_70_code.json").exists());
+            assert_eq!(
+                fs::read(dir.path().join("dex_65_1000_70.dex")).unwrap(),
+                test_dex(1)
+            );
+        }
+
+        #[test]
+        fn conflicting_chunks_and_size_changes_are_quarantined() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = DumpState::new(dir.path().into(), false, false, false);
+            state.handle_dex_chunk(&chunk_event(101, 0, &test_dex(1)[..56]));
+            state.handle_dex_chunk(&chunk_event(101, 0, &test_dex(2)[..56]));
+            assert!(state.pending_dex.read().unwrap().is_empty());
+            assert!(state.ambiguous_dex.read().unwrap().contains(&(101, 0x1000)));
+            state.observe_dex(202, 0x1000, DEX_HEADER_SIZE);
+            state.observe_dex(202, 0x1000, DEX_HEADER_SIZE + 4);
+            assert!(state.ambiguous_dex.read().unwrap().contains(&(202, 0x1000)));
+        }
+
+        #[test]
+        fn invalid_chunk_range_does_not_allocate_or_panic() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = DumpState::new(dir.path().into(), false, false, false);
+            state.handle_dex_chunk(&chunk_event(101, u32::MAX, &[1, 2]));
+            assert!(state.pending_dex.read().unwrap().is_empty());
+        }
 
         fn empty_state(total: u32) -> DexRecvState {
             DexRecvState {

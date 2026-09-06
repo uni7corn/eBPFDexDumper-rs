@@ -19,7 +19,16 @@ adb push target/aarch64-linux-android/release/eBPFDexDumper /data/local/tmp/
 adb shell su -c '/data/local/tmp/eBPFDexDumper dump -n com.example.app -o /data/local/tmp/dex_out'
 ```
 
-默认 `full` 模式，退出时自动修复并校验 DEX。输出在 `final/` 目录。
+默认 `full` 模式，退出时自动修复 DEX，输出在 `repair/` 目录；单独运行 `fix` 的汇总输出仍在 `final/`。
+
+## 注意事项
+
+- 抓取按进程隔离，文件名为 `dex_<pid>_<begin>_<size>.dex`（十六进制），兼容旧文件名。每次抓取请使用新目录。
+- `repair` 保留原文件，检查结构及校验和；失败返回非零状态。检查通过不等于完整 ART 字节码验证。
+- 正常停止会排空 JNI 等事件队列；再次发送停止信号会中止排空。
+- 部分 API 35 系统的 JNI 自动定位不准确，可用 `--register-natives-offset` 指定当前 `libart.so` 的已核实偏移。
+
+[验证结果与限制](docs/DEFENSIVE_VALIDATION.md) · [构建与贡献](CONTRIBUTING.md)
 
 ## 子命令
 

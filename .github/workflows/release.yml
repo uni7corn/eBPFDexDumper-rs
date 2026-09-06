@@ -1,6 +1,7 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*"
@@ -13,40 +14,51 @@ jobs:
     name: Build and Publish Android ARM64
     runs-on: ubuntu-latest
     steps:
+      - name: Require a release tag
+        run: |
+          test "$GITHUB_REF_TYPE" = tag
+          [[ "$GITHUB_REF_NAME" == v* ]]
+
       - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref }}
+        run: |
+          git init .
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 
       - name: Install LLVM clang
         run: sudo apt-get update && sudo apt-get install -y clang llvm
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
 
       - name: Install Android target
         run: rustup target add aarch64-linux-android
 
       - name: Install Android NDK
-        uses: nttld/setup-ndk@v1
-        id: setup-ndk
-        with:
-          ndk-version: r27c
-          add-to-path: false
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.2.12479018"
 
       - name: Configure Android linker
         run: |
-          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android23-clang" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${ANDROID_HOME}/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android23-clang" >> "$GITHUB_ENV"
 
       - name: Package release
         run: ./scripts/package-release.sh
 
       - name: Upload release assets
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: |
-            dist/eBPFDexDumper_android_arm64
-            dist/eBPFDexDumper_android_arm64.sha256
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+          fi
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            dist/eBPFDexDumper_android_arm64 \
+            dist/eBPFDexDumper_android_arm64.sha256 \
             dist/eBPFDexDumper_android_arm64.tar.gz

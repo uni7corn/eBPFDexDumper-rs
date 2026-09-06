@@ -1,26 +1,21 @@
 # 贡献指南
 
-感谢你关注 `eBPFDexDumper-rs`。这个项目的目标是提供稳定、可维护、可发布的
-Android eBPF DEX dump 工具。
+## 环境
 
-## 开发环境
-
-建议准备以下工具：
-
-- Rust stable 工具链。
-- 支持 BPF target 的 LLVM clang。
-- Android NDK，用于 Android ARM64 Release 构建。
-
-macOS 自带的 Apple clang 通常不能编译 eBPF，建议安装 Homebrew LLVM：
+需要 Rust stable、支持 BPF target 的 LLVM clang 和 Android NDK（CI 使用 r27c）。
 
 ```bash
+# macOS
 brew install llvm
 export CLANG=/opt/homebrew/opt/llvm/bin/clang
+
+rustup target add aarch64-linux-android
+export ANDROID_NDK_HOME=/path/to/android-sdk/ndk/27.2.12479018
 ```
 
-## 提交前检查
+混用 Homebrew Rust 与 rustup 时，可设置 `RUSTC="$(rustup which rustc)"`。
 
-提交改动前建议执行：
+## 检查
 
 ```bash
 cargo fmt --check
@@ -28,32 +23,23 @@ cargo test --locked
 sh build_android.sh
 ```
 
-Android Release 可执行文件会生成在：
+Android 二进制：`target/aarch64-linux-android/release/eBPFDexDumper`。
+采集、BPF 或退出流程改动还需设备测试，见[验证记录](docs/DEFENSIVE_VALIDATION.md)。
 
-```text
-target/aarch64-linux-android/release/eBPFDexDumper
-```
-
-如果只改了文档，也至少确认 Markdown 内容准确，不要写超过当前实现能力的功能描述。
-
-## 打包
-
-本地复现 GitHub Release 产物：
+## 发布
 
 ```bash
 ./scripts/package-release.sh
 ```
 
-生成文件位于 `dist/`。
+产物在 `dist/`。推送新 `v*` 标签触发 Release，也支持对标签手动运行；不要移动旧标签。
 
-## 代码要求
+工作流仅用 `run`，兼容 owner-only Actions 策略；依赖 Ubuntu runner 的 Git、
+rustup、sdkmanager 和 gh。修改工作流后运行 `actionlint`。
 
-- 保持 `dump`、`fix`、`offsets` 的命令行为稳定。
-- 优先使用已有模块和数据结构，不做无关重构。
-- 涉及 eBPF、ART 偏移、DEX 修复逻辑的改动，需要尽量补充或更新测试。
-- 不提交 `target/`、`dist/`、`.DS_Store` 等本地生成文件。
+## 提交要求
 
-## 安全边界
-
-请不要提交用于绕过授权、攻击第三方设备或泄露敏感数据的示例。项目只面向授权的
-Android 逆向分析和安全研究场景。
+- 沿用现有结构，只改相关代码，并补充测试。
+- 不提交 `target/`、`dist/`、`.DS_Store` 等生成文件。
+- 文档只描述已实现、已验证的行为。
+- 示例仅用于授权测试，不包含第三方敏感数据。

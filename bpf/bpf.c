@@ -237,6 +237,14 @@ static __always_inline int read_code_item_from_art_method(
     return *code_item_ptr != 0;
 }
 
+static __always_inline struct capture_key_t dex_key(u32 pid, u64 begin, u32 size)
+{
+    struct capture_key_t key = { .addr = begin, .pid = pid, .size = size };
+    // Checksum and signature prefix distinguish common address reuse cases.
+    bpf_probe_read_user(&key.identity, sizeof(key.identity), (void *)(begin + 8));
+    return key;
+}
+
 static __always_inline void submit_dex_from_begin(u32 pid, u64 begin, u32 size)
 {
     if (begin == 0 || size == 0 || size > MAX_DEX_FILE_SIZE) {
@@ -244,8 +252,10 @@ static __always_inline void submit_dex_from_begin(u32 pid, u64 begin, u32 size)
     }
 
     u32 exist = 1;
-    u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
+    struct capture_key_t key = dex_key(pid, begin, size);
+    u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &key);
     if (value != 0 && *value == 1) {
+        submit_dex_chunks_partial(begin, pid, size);
         return;
     }
 
@@ -257,7 +267,7 @@ static __always_inline void submit_dex_from_begin(u32 pid, u64 begin, u32 size)
         bpf_ringbuf_submit(dex_evt, BPF_RB_FORCE_WAKEUP);
     }
     submit_dex_chunks_partial(begin, pid, size);
-    bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
+    bpf_map_update_elem(&dexFileCache_map, &key, &exist, BPF_ANY);
 }
 
 static __always_inline int read_dex_from_art_method(
@@ -368,12 +378,6 @@ static __always_inline
 u32 read_method_bytecode(u64 art_method_ptr, u32 *codeitem_size) {
     *codeitem_size = 0;
     
-    // Check if this method's bytecode has already been read
-    u32 *cached = (u32 *)bpf_map_lookup_elem(&methodCodeCache_map, &art_method_ptr);
-    if (cached && *cached == 1) {
-        return 0; // Already read, don't read again
-    }
-    
     // Get the CodeItem pointer from ArtMethod
     struct art_layout_t *layout = get_art_layout();
     u64 code_item_ptr = 0;
@@ -388,6 +392,17 @@ u32 read_method_bytecode(u64 art_method_ptr, u32 *codeitem_size) {
     }
     
     if (insns_size == 0 || insns_size > 0x10000) { // Sanity check
+        return 0;
+    }
+
+    struct capture_key_t key = {
+        .addr = art_method_ptr,
+        .identity = code_item_ptr,
+        .pid = current_tgid(),
+        .size = insns_size,
+    };
+    u32 *cached = (u32 *)bpf_map_lookup_elem(&methodCodeCache_map, &key);
+    if (cached && *cached == 1) {
         return 0;
     }
     
@@ -425,7 +440,7 @@ u32 read_method_bytecode(u64 art_method_ptr, u32 *codeitem_size) {
     
     // Mark this method as read
     u32 read_flag = 1;
-    bpf_map_update_elem(&methodCodeCache_map, &art_method_ptr, &read_flag, BPF_ANY);
+    bpf_map_update_elem(&methodCodeCache_map, &key, &read_flag, BPF_ANY);
     
     return 1;
 }
@@ -481,7 +496,8 @@ static __always_inline void submit_dex_chunks_partial(u64 begin, u32 pid, u32 si
     if (size == 0) return;
 
     // load current progress
-    u32 *pnext = (u32 *)bpf_map_lookup_elem(&dexProgress_map, &begin);
+    struct capture_key_t key = dex_key(pid, begin, size);
+    u32 *pnext = (u32 *)bpf_map_lookup_elem(&dexProgress_map, &key);
     u32 next_off = 0;
     if (pnext) {
         next_off = *pnext;
@@ -561,7 +577,7 @@ static __always_inline void submit_dex_chunks_partial(u64 begin, u32 pid, u32 si
     }
 
     // store progress
-    bpf_map_update_elem(&dexProgress_map, &begin, &next_off, BPF_ANY);
+    bpf_map_update_elem(&dexProgress_map, &key, &next_off, BPF_ANY);
 }
 
 static __always_inline int handle_art_method(struct config_t *conf, u32 pid, u64 art_method_ptr)
@@ -619,19 +635,7 @@ static __always_inline int handle_art_method(struct config_t *conf, u32 pid, u64
         0,
         LAYOUT_SOURCE_ART_CHAIN);
 
-    u32 exist = 1;
-    u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
-    if (value == 0 || *value != 1) {
-        struct dex_event_data_t *dex_evt = (struct dex_event_data_t *)bpf_ringbuf_reserve(&events, sizeof(struct dex_event_data_t), 0);
-        if (dex_evt) {
-            dex_evt->begin = begin;
-            dex_evt->pid = pid;
-            dex_evt->size = size;
-            bpf_ringbuf_submit(dex_evt, BPF_RB_FORCE_WAKEUP);
-        }
-        submit_dex_chunks_partial(begin, pid, size);
-        bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
-    }
+    submit_dex_from_begin(pid, begin, size);
 
     u32 codeitem_size = 0;
     read_method_bytecode(art_method_ptr, &codeitem_size);
@@ -919,24 +923,7 @@ int uprobe_libart_verifyClass(struct pt_regs *ctx)
             layout->dex_header_file_size_offset,
             &begin,
             &size)) {
-        u32 exist = 1;
-        u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
-
-        if (value != 0 && *value == 1){
-            return 0;
-        }
-
-        struct dex_event_data_t *evt_ptr = (struct dex_event_data_t *)bpf_ringbuf_reserve(&events, sizeof(struct dex_event_data_t), 0);
-        if (evt_ptr) {
-            evt_ptr->begin = begin;
-            evt_ptr->pid = pid;
-            evt_ptr->size = size;
-            bpf_ringbuf_submit(evt_ptr, BPF_RB_FORCE_WAKEUP);
-        }
-        bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
-
-        // submit dex chunks progressively via ringbuf
-        submit_dex_chunks_partial(begin, pid, size);
+        submit_dex_from_begin(pid, begin, size);
     }
     return 0;
 }

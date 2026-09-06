@@ -30,9 +30,7 @@ pub struct FixOptions {
     /// stream / payload alignment.
     pub force_mismatch: bool,
 
-    /// Deduplicate DEX files by SHA256 before repairing.
-    /// When multiple copies of the same DEX exist (loaded at different addresses),
-    /// only the one with the most bytecode records is kept.
+    /// Skip identical DEX/record pairs without deleting any input files.
     pub dedup: bool,
 }
 
@@ -94,10 +92,10 @@ pub fn fix_dex_directory_with(output_dir: &Path, options: FixOptions) -> Result<
     fs::create_dir_all(&final_dir)
         .with_context(|| format!("failed to create {}", final_dir.display()))?;
 
+    let mut failures = 0;
     for (base, dex_path) in dex_files {
         if !crate::shutdown::keep_finalizing() {
-            eprintln!("[!] auto-fix aborted by user; remaining files left as-is");
-            break;
+            anyhow::bail!("fix interrupted; remaining files left as-is");
         }
         let final_path = final_dir.join(format!("{base}.dex"));
         let display_name = dex_path
@@ -128,6 +126,7 @@ pub fn fix_dex_directory_with(output_dir: &Path, options: FixOptions) -> Result<
                         if !coverage.missed_methods.is_empty() {
                             let missed_path = final_dir.join(format!("{base}_missed.json"));
                             if let Err(err) = write_coverage_report(&missed_path, coverage) {
+                                failures += 1;
                                 eprintln!(
                                     "[!] failed to write coverage report {}: {err:#}",
                                     missed_path.display()
@@ -140,6 +139,7 @@ pub fn fix_dex_directory_with(output_dir: &Path, options: FixOptions) -> Result<
                         println!("[+] Final {}", final_path.display());
                     }
                     Err(err) => {
+                        failures += 1;
                         println!("[!] Fix failed for {}: {err:#}", dex_path.display());
                         copy_file(&dex_path, &final_path)?;
                         println!("[+] Final fallback {}", final_path.display());
@@ -153,6 +153,10 @@ pub fn fix_dex_directory_with(output_dir: &Path, options: FixOptions) -> Result<
         }
     }
 
+    anyhow::ensure!(
+        failures == 0,
+        "{failures} fix/report failure(s); fallback copies are not repaired outputs"
+    );
     Ok(())
 }
 
@@ -387,20 +391,7 @@ fn dex_code_json_base(name: &str) -> Option<String> {
         return None;
     }
     let stem = name.strip_suffix("_code.json")?;
-    let mut parts = stem.split('_');
-    if parts.next()? != "dex" {
-        return None;
-    }
-    let begin = parts.next()?;
-    let size = parts.next()?;
-    if parts.next().is_some() || begin.is_empty() || size.is_empty() {
-        return None;
-    }
-    if begin.bytes().all(|b| b.is_ascii_hexdigit()) && size.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Some(stem.to_string())
-    } else {
-        None
-    }
+    dex_file_base(&format!("{stem}.dex"))
 }
 
 fn dex_file_base(name: &str) -> Option<String> {
@@ -408,16 +399,14 @@ fn dex_file_base(name: &str) -> Option<String> {
         return None;
     }
     let stem = name.strip_suffix(".dex")?;
-    let mut parts = stem.split('_');
-    if parts.next()? != "dex" {
-        return None;
-    }
-    let begin = parts.next()?;
-    let size = parts.next()?;
-    if parts.next().is_some() || begin.is_empty() || size.is_empty() {
-        return None;
-    }
-    if begin.bytes().all(|b| b.is_ascii_hexdigit()) && size.bytes().all(|b| b.is_ascii_hexdigit()) {
+    // Legacy begin/size, process-qualified pid/begin/size, or quarantined
+    // pid/begin/content-hash/size. All identity fields are hexadecimal.
+    let parts: Vec<_> = stem.strip_prefix("dex_")?.split('_').collect();
+    if (2..=4).contains(&parts.len())
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
         Some(stem.to_string())
     } else {
         None
@@ -500,21 +489,13 @@ pub struct RepairStats {
     pub unrecovered: usize,
     /// Format fields (debug_info_off, tries_size, interfaces_off, etc.) fixed.
     pub format_fixed: bool,
-    /// Post-fix DexParser::new validation result.
+    /// Bounded structural and checksum checks, not ART bytecode verification.
     pub validation_passed: bool,
     /// Methods whose bytecode record could not be decoded.
     pub bytecode_decode_failed: usize,
 }
 
 impl RepairStats {
-    fn changed(&self) -> bool {
-        self.header_fixed
-            || self.map_rebuilt
-            || self.inline_applied > 0
-            || self.appended > 0
-            || self.bytecode_decode_failed > 0
-    }
-
     fn summary(&self) -> String {
         let mut parts = Vec::new();
         if self.inline_applied > 0 {
@@ -542,7 +523,7 @@ impl RepairStats {
             parts.push("format fields fixed".to_string());
         }
         if self.validation_passed {
-            parts.push("validation OK".to_string());
+            parts.push("structure/checksums OK (not ART verification)".to_string());
         } else if self.format_fixed
             || self.header_fixed
             || self.map_rebuilt
@@ -561,67 +542,37 @@ impl RepairStats {
     }
 }
 
-/// Deduplicate DEX files by size suffix (from the filename) before repair.
-/// When multiple copies of the same DEX exist (loaded at different addresses),
-/// only the one with the largest file size (most complete read) is kept.
-fn dedup_dex_files(dex_files: &[(String, PathBuf)]) -> Vec<(String, PathBuf)> {
-    if dex_files.is_empty() {
-        return dex_files.to_vec();
-    }
-
-    // Group by size suffix (hex file size in the filename, e.g. "db89d4")
-    // This is more reliable than SHA1 when process_vm_readv produces partial reads.
-    let mut by_size: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new();
+/// Skip only identical DEX and bytecode-record inputs; retain all originals.
+fn dedup_dex_files(dex_files: &[(String, PathBuf)], records_dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut seen = HashSet::new();
+    let mut retained = Vec::new();
     for (base, path) in dex_files {
-        if let Some(size_suffix) = base.rsplit('_').next() {
-            by_size
-                .entry(size_suffix.to_string())
-                .or_default()
-                .push((base.clone(), path.clone()));
-        }
-    }
-
-    let mut deduped = Vec::with_capacity(by_size.len());
-    let mut removed = 0usize;
-    for (suffix, group) in &by_size {
-        if group.len() == 1 {
-            deduped.push(group[0].clone());
+        let Ok(bytes) = fs::read(path) else {
+            retained.push((base.clone(), path.clone()));
             continue;
-        }
-
-        // Pick the file with the largest on-disk size (most bytes read)
-        // This handles partial reads where process_vm_readv couldn't read everything.
-        let best = group
-            .iter()
-            .max_by_key(|(_, path)| fs::metadata(path).map(|m| m.len()).unwrap_or(0))
-            .unwrap();
-
-        for (base, path) in group {
-            if base != &best.0 {
-                removed += 1;
-                // Remove the duplicate file to save space
-                let _ = fs::remove_file(path);
+        };
+        let records_path = records_dir.join(format!("{base}_code.json"));
+        let records = match fs::read(&records_path) {
+            Ok(records) => Some(records),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => {
+                retained.push((base.clone(), path.clone()));
+                continue;
             }
+        };
+        let identity = (
+            Sha1::digest(&bytes).to_vec(),
+            records
+                .as_ref()
+                .map(|records| Sha1::digest(records).to_vec()),
+        );
+        if seen.insert(identity) {
+            retained.push((base.clone(), path.clone()));
+        } else {
+            println!("[=] Duplicate input {base}: skipped; original retained");
         }
-        deduped.push(best.clone());
-        let best_size = fs::metadata(&best.1).map(|m| m.len()).unwrap_or(0);
-        println!(
-            "[-] dedup: {} copies of size {} -> kept {} ({} bytes, largest read)",
-            group.len(),
-            suffix,
-            best.0,
-            best_size
-        );
     }
-
-    if removed > 0 {
-        println!(
-            "[+] Dedup removed {removed} duplicate files, {deduped_len} unique remain",
-            removed = removed,
-            deduped_len = deduped.len()
-        );
-    }
-    deduped
+    retained
 }
 
 /// Repair every `dex_*.dex` under `dex_dir`, writing results to `dex_dir/repair`.
@@ -639,105 +590,98 @@ pub fn repair_directory(
 ) -> Result<()> {
     let records_dir = code_records_dir.unwrap_or(dex_dir);
     let dex_files = find_root_dex_files(dex_dir)?;
-    if dex_files.is_empty() {
-        anyhow::bail!("no dex_*.dex found in {}", dex_dir.display());
-    }
-    // find_root_dex_files hands back a HashMap; sort so runs are reproducible.
+    anyhow::ensure!(
+        !dex_files.is_empty(),
+        "no dex_*.dex found in {}",
+        dex_dir.display()
+    );
     let mut dex_files: Vec<_> = dex_files.into_iter().collect();
     dex_files.sort();
-
-    // Deduplicate by content before repairing
     if options.dedup {
-        dex_files = dedup_dex_files(&dex_files);
+        dex_files = dedup_dex_files(&dex_files, records_dir);
     }
-
     let repair_dir = dex_dir.join("repair");
-    fs::create_dir_all(&repair_dir)
-        .with_context(|| format!("failed to create {}", repair_dir.display()))?;
-
-    let records_dir_ref: &std::path::Path = records_dir.as_ref();
-    let repair_dir_ref: &std::path::Path = repair_dir.as_ref();
-    let results: Vec<(String, String)> = std::thread::scope(|s| {
-        let mut handles = Vec::new();
-        for (base, dex_path) in &dex_files {
-            if !crate::shutdown::keep_finalizing() {
-                break;
+    fs::create_dir_all(&repair_dir)?;
+    let mut written = 0;
+    let mut failures = Vec::new();
+    // Bound peak memory: each repair may relocate most of its input.
+    for (base, dex_path) in &dex_files {
+        anyhow::ensure!(
+            crate::shutdown::keep_finalizing(),
+            "repair interrupted after {written} output(s)"
+        );
+        let result = (|| -> Result<RepairStats> {
+            let json_path = records_dir.join(format!("{base}_code.json"));
+            let records = match fs::read(&json_path) {
+                Ok(bytes) => Some(
+                    serde_json::from_slice::<Vec<MethodCodeRecord>>(&bytes)
+                        .with_context(|| format!("invalid {}", json_path.display()))?,
+                ),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => {
+                    return Err(err).with_context(|| format!("read {}", json_path.display()))
+                }
+            };
+            let mut bytes = fs::read(dex_path)?;
+            let stats = repair_one_dex(&mut bytes, records.as_deref(), options)?;
+            anyhow::ensure!(
+                stats.append_failed == 0,
+                "{} unusable method capture(s)",
+                stats.append_failed
+            );
+            atomic_write(&repair_dir.join(format!("{base}.dex")), &bytes)?;
+            Ok(stats)
+        })();
+        match result {
+            Ok(stats) => {
+                written += 1;
+                println!("[+] {base}: {}", stats.summary());
             }
-            let base = base.clone();
-            let dex_path = dex_path.clone();
-            let handle = s.spawn(move || {
-                if !crate::shutdown::keep_finalizing() {
-                    return (String::new(), String::new());
-                }
-                let display_name = dex_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned();
-
-                let json_path = records_dir_ref.join(format!("{base}_code.json"));
-                let records = if json_path.is_file() {
-                    match read_records(&json_path) {
-                        Ok(records) => Some(records),
-                        Err(err) => {
-                            eprintln!("[!] ignoring {}: {err:#}", json_path.display());
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                let mut dex_bytes = match fs::read(&dex_path) {
-                    Ok(b) => b,
-                    Err(err) => {
-                        eprintln!("[!] failed to read {}: {err:#}", dex_path.display());
-                        return (display_name, String::new());
-                    }
-                };
-                let stats = match repair_one_dex(&mut dex_bytes, records.as_deref(), options) {
-                    Ok(stats) => stats,
-                    Err(err) => {
-                        return (display_name, format!("{err:#}"));
-                    }
-                };
-                let out_path = repair_dir_ref.join(dex_path.file_name().unwrap_or_default());
-                if let Err(err) = fs::write(&out_path, &dex_bytes) {
-                    eprintln!("[!] failed to write {}: {err:#}", out_path.display());
-                    return (display_name, String::new());
-                }
-                (display_name, stats.summary())
-            });
-            handles.push(handle);
-        }
-        handles
-            .into_iter()
-            .filter_map(|h| {
-                let (name, summary) = h.join().unwrap();
-                if name.is_empty() {
-                    None
-                } else {
-                    Some((name, summary))
-                }
-            })
-            .collect()
-    });
-
-    let rewritten = results.len();
-    for (display_name, summary) in &results {
-        if summary.is_empty() {
-            println!("[=] {display_name}: nothing to repair");
-        } else {
-            println!("[+] {display_name}: {summary}");
+            Err(err) => {
+                eprintln!("[!] {base}: {err:#}");
+                failures.push(format!("{base}: {err:#}"));
+            }
         }
     }
-
     println!(
-        "[+] Repair complete: {rewritten}/{} files copied -> {}",
+        "[+] Repair complete: {written}/{} files written -> {}; {} failed",
         dex_files.len(),
-        repair_dir.display()
+        repair_dir.display(),
+        failures.len()
+    );
+    anyhow::ensure!(
+        failures.is_empty(),
+        "{} repair failure(s): {}",
+        failures.len(),
+        failures.join("; ")
     );
     Ok(())
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let temp = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    let result = (|| -> Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result.with_context(|| format!("write {}", path.display()))
 }
 
 /// Repair one DEX buffer in place, reporting what changed.
@@ -747,58 +691,50 @@ fn repair_one_dex(
     options: FixOptions,
 ) -> Result<RepairStats> {
     let mut stats = RepairStats::default();
-    if dex_bytes.len() < DEX_HEADER_SIZE || !dex_bytes.starts_with(b"dex\n") {
-        return Ok(stats);
-    }
+    DexParser::new(dex_bytes)?;
+    // Reject unreadable tables before any in-place edits or relocation.
+    validate_id_bounds(dex_bytes)?;
+    read_map_entries(dex_bytes)?;
 
     // Bytecode first: both halves of it append to the file, and the map has to
     // come after everything else.
     // Always run restore_bytecode, even without records, to zero out bad code_offs.
     let bytecode_records: &[MethodCodeRecord] = records.unwrap_or(&[]);
-    restore_bytecode(dex_bytes, bytecode_records, options, &mut stats);
+    let relocated = restore_bytecode(dex_bytes, bytecode_records, options, &mut stats)?;
     stats.format_fixed = fix_format_fields(dex_bytes);
-    stats.map_rebuilt = rebuild_map(dex_bytes);
+    stats.map_rebuilt = rebuild_map(dex_bytes, relocated.as_deref())?;
     // Header bounds last, once the file has reached its final length.
     stats.header_fixed = fix_header_bounds(dex_bytes);
 
-    if stats.changed() {
-        recalc_dex_header(dex_bytes);
-        // Validate the fixed DEX
-        match DexParser::new(dex_bytes) {
-            Ok(_) => stats.validation_passed = true,
-            Err(err) => {
-                eprintln!("[!] post-repair validation failed: {err:#}");
-                stats.validation_passed = false;
-            }
-        }
-    }
+    recalc_dex_header(dex_bytes);
+    validate_repaired_dex(dex_bytes)?;
+    stats.validation_passed = true;
     Ok(stats)
 }
 
 /// Put every captured method body back: in place where the `code_item`
 /// survived, as a freshly appended one where it did not.
 ///
-/// Failures here are reported and stepped over — a DEX we cannot read method
-/// bodies out of can still have its header and map repaired.
+/// Structural failures propagate; unusable individual captures are counted.
 fn restore_bytecode(
     dex_bytes: &mut Vec<u8>,
     records: &[MethodCodeRecord],
     options: FixOptions,
     stats: &mut RepairStats,
-) {
+) -> Result<Option<Vec<MapEntry>>> {
     let method2off = {
         let parser = match DexParser::new(dex_bytes) {
             Ok(parser) => parser,
             Err(err) => {
                 eprintln!("[!] {err}");
-                return;
+                return Err(err.into());
             }
         };
         match build_method_code_off_map(&parser) {
             Ok(map) => map,
             Err(err) => {
                 eprintln!("[!] class_data unreadable, skipping bytecode restore: {err:#}");
-                return;
+                return Err(err);
             }
         }
     };
@@ -827,8 +763,9 @@ fn restore_bytecode(
             if let Some(reason) = outcome.first_failure {
                 eprintln!("[!] {} record(s) unusable, first: {reason}", outcome.failed);
             }
+            Ok(outcome.relocated)
         }
-        Err(err) => eprintln!("[!] code_item rebuild failed: {err:#}"),
+        Err(err) => Err(err.context("code_item rebuild failed")),
     }
 }
 
@@ -838,6 +775,7 @@ struct AppendOutcome {
     failed: usize,
     unrecovered: usize,
     first_failure: Option<String>,
+    relocated: Option<Vec<MapEntry>>,
 }
 
 /// Give every method whose `code_item` the packer stripped a new one, built
@@ -846,13 +784,11 @@ struct AppendOutcome {
 /// `code_off` lives in `class_data_item` as a ULEB128 and a new offset rarely
 /// encodes to the same width, so the whole `class_data_item` is re-encoded and
 /// appended as well; only `class_def.class_data_off`, a fixed-width `u32`, is
-/// patched in place. The originals stay where they are as unreferenced bytes.
+/// patched in place. Retired mapped sections are zeroed after all copies;
+/// ART requires the gaps between remaining sections to contain zero padding.
 ///
-/// The appended items break the spec's requirement that items of one type be
-/// contiguous. Tools reach a method body through `class_defs` -> `class_data`
-/// -> `code_off` rather than through the map, so this is what every DEX
-/// unpacker does; the map's counts are deliberately left alone so that anything
-/// reading it sequentially still sees a self-consistent original run.
+/// When any item changes, relocate all live code and class data into two
+/// contiguous runs and return their replacement map entries.
 fn append_missing_code_items(
     dex_bytes: &mut Vec<u8>,
     records: &[MethodCodeRecord],
@@ -867,6 +803,7 @@ fn append_missing_code_items(
     // Plan every edit while the parser holds its immutable borrow, then apply
     // them once it is gone.
     let mut planned: Vec<(usize, ClassData)> = Vec::new();
+    let mut needs_relocation = false;
     {
         let parser = DexParser::new(dex_bytes)?;
         let header = parser.header();
@@ -882,12 +819,10 @@ fn append_missing_code_items(
                 break;
             };
             let class_data_off = le32(&class_def[24..]);
-            if class_data_off == 0 || class_data_off as usize >= dex_bytes.len() {
+            if class_data_off == 0 {
                 continue;
             }
-            let Ok(mut class_data) = parse_class_data(dex_bytes, class_data_off) else {
-                continue;
-            };
+            let mut class_data = parse_class_data(dex_bytes, class_data_off)?;
 
             let mut touched = false;
             for method in class_data.methods_mut() {
@@ -897,6 +832,9 @@ fn append_missing_code_items(
                     continue;
                 }
                 let on_disk = code_item_insns_len(dex_bytes, method.code_off);
+                if on_disk.is_some() {
+                    code_item_end(dex_bytes, method.code_off)?;
+                }
                 let Some(record) = by_method.get(&method.method_idx) else {
                     // Nothing captured for it. Only worth reporting when the
                     // DEX has no body for it either.
@@ -935,24 +873,68 @@ fn append_missing_code_items(
                 }
             }
             if touched {
-                planned.push((class_def_off, class_data));
+                needs_relocation = true;
             }
+            planned.push((class_def_off, class_data));
         }
     }
 
-    for (class_def_off, mut class_data) in planned {
+    if !needs_relocation {
+        return Ok(outcome);
+    }
+    let original_len = dex_bytes.len();
+    let original_map = read_map_entries(dex_bytes)?;
+    let mut retired = Vec::new();
+    for entry in original_map
+        .iter()
+        .filter(|entry| matches!(entry.typ, 0x2000 | 0x2001))
+    {
+        let start = entry.off as usize;
+        let end = original_map
+            .iter()
+            .filter(|next| next.off > entry.off)
+            .map(|next| next.off as usize)
+            .min()
+            .unwrap_or(original_len);
+        anyhow::ensure!(
+            start >= DEX_HEADER_SIZE && start < end && end <= original_len,
+            "invalid retired section bounds"
+        );
+        retired.push(start..end);
+    }
+    let mut code_map = MapEntry {
+        typ: 0x2001,
+        size: 0,
+        off: 0,
+    };
+    for (_, class_data) in &mut planned {
         for method in class_data.methods_mut() {
-            let Some(code_item) = method.pending_code.take() else {
+            let code_item = if let Some(code) = method.pending_code.take() {
+                outcome.appended += 1;
+                code
+            } else if method.code_off != 0 {
+                let end = code_item_end(dex_bytes, method.code_off)?;
+                dex_bytes[method.code_off as usize..end].to_vec()
+            } else {
                 continue;
             };
-            // code_item is a 4-byte aligned structure.
             align_to(dex_bytes, 4);
-            method.code_off = u32::try_from(dex_bytes.len())
+            let new_off = u32::try_from(dex_bytes.len())
                 .context("DEX grew past 4 GiB while rebuilding code items")?;
+            if code_map.size == 0 {
+                code_map.off = new_off;
+            }
+            code_map.size += 1;
+            method.code_off = new_off;
             dex_bytes.extend_from_slice(&code_item);
-            outcome.appended += 1;
         }
-
+    }
+    let class_map = MapEntry {
+        typ: 0x2000,
+        size: u32::try_from(planned.len())?,
+        off: u32::try_from(dex_bytes.len())?,
+    };
+    for (class_def_off, class_data) in planned {
         let encoded = encode_class_data(&class_data);
         let class_data_off = u32::try_from(dex_bytes.len())
             .context("DEX grew past 4 GiB while rebuilding class data")?;
@@ -960,7 +942,10 @@ fn append_missing_code_items(
         dex_bytes[class_def_off + 24..class_def_off + 28]
             .copy_from_slice(&class_data_off.to_le_bytes());
     }
-
+    for range in retired {
+        dex_bytes[range].fill(0);
+    }
+    outcome.relocated = Some(vec![code_map, class_map]);
     Ok(outcome)
 }
 
@@ -1128,18 +1113,23 @@ fn read_encoded_methods(data: &[u8], pos: &mut usize, count: u32) -> Result<Vec<
 }
 
 fn parse_class_data(dex_bytes: &[u8], class_data_off: u32) -> Result<ClassData> {
+    Ok(parse_class_data_end(dex_bytes, class_data_off)?.0)
+}
+
+fn parse_class_data_end(dex_bytes: &[u8], class_data_off: u32) -> Result<(ClassData, usize)> {
     let mut pos = class_data_off as usize;
     let static_count = take_uleb(dex_bytes, &mut pos)?;
     let instance_count = take_uleb(dex_bytes, &mut pos)?;
     let direct_count = take_uleb(dex_bytes, &mut pos)?;
     let virtual_count = take_uleb(dex_bytes, &mut pos)?;
 
-    Ok(ClassData {
+    let class = ClassData {
         static_fields: read_encoded_fields(dex_bytes, &mut pos, static_count)?,
         instance_fields: read_encoded_fields(dex_bytes, &mut pos, instance_count)?,
         direct_methods: read_encoded_methods(dex_bytes, &mut pos, direct_count)?,
         virtual_methods: read_encoded_methods(dex_bytes, &mut pos, virtual_count)?,
-    })
+    };
+    Ok((class, pos))
 }
 
 /// Re-encode a `class_data_item`. Indices are stored as deltas and each of the
@@ -1204,102 +1194,296 @@ fn read_u32_at(data: &[u8], off: usize) -> Option<u32> {
 /// Returns false when the map is already in shape, or when `map_off` does not
 /// point at a readable table — a packer that aims it into nowhere leaves
 /// nothing to rebuild from, and inventing a map wholesale would be guesswork.
-fn rebuild_map(dex_bytes: &mut Vec<u8>) -> bool {
-    #[derive(Clone, Copy)]
-    struct MapEntry {
-        typ: u16,
-        size: u32,
-        off: u32,
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MapEntry {
+    typ: u16,
+    size: u32,
+    off: u32,
+}
 
-    let map_off = match read_u32_at(dex_bytes, HDR_MAP_OFF) {
-        Some(off) => off as usize,
-        None => return false,
-    };
-    let Some(count) = read_u32_at(dex_bytes, map_off) else {
-        return false;
-    };
-    let Some(table_end) = map_off.checked_add(4).and_then(|start| {
-        (count as usize)
-            .checked_mul(12)
-            .and_then(|len| start.checked_add(len))
-    }) else {
-        return false;
-    };
-    if table_end > dex_bytes.len() {
-        return false;
+fn read_map_entries(bytes: &[u8]) -> Result<Vec<MapEntry>> {
+    let off = read_u32_at(bytes, HDR_MAP_OFF).context("missing map_off")? as usize;
+    anyhow::ensure!(
+        off >= DEX_HEADER_SIZE && off.is_multiple_of(4),
+        "invalid map_off"
+    );
+    let count = read_u32_at(bytes, off).context("unreadable map list")? as usize;
+    let end = off
+        .checked_add(4)
+        .and_then(|p| count.checked_mul(12).and_then(|n| p.checked_add(n)))
+        .context("map list overflow")?;
+    anyhow::ensure!(count != 0 && end <= bytes.len(), "map list out of bounds");
+    let mut types = HashSet::new();
+    let mut entries = Vec::new();
+    for i in 0..count {
+        let at = off + 4 + i * 12;
+        let entry = MapEntry {
+            typ: u16::from_le_bytes([bytes[at], bytes[at + 1]]),
+            size: le32(&bytes[at + 4..]),
+            off: le32(&bytes[at + 8..]),
+        };
+        anyhow::ensure!(
+            types.insert(entry.typ),
+            "duplicate map type 0x{:x}",
+            entry.typ
+        );
+        anyhow::ensure!(
+            entry.size != 0 && (entry.off as usize) < bytes.len(),
+            "map item out of bounds"
+        );
+        entries.push(entry);
     }
+    Ok(entries)
+}
 
-    let mut entries: Vec<MapEntry> = (0..count as usize)
-        .map(|i| {
-            let at = map_off + 4 + i * 12;
-            MapEntry {
-                typ: u16::from_le_bytes([dex_bytes[at], dex_bytes[at + 1]]),
-                size: le32(&dex_bytes[at + 4..]),
-                off: le32(&dex_bytes[at + 8..]),
+fn rebuild_map(dex_bytes: &mut Vec<u8>, relocated: Option<&[MapEntry]>) -> Result<bool> {
+    let mut entries = read_map_entries(dex_bytes)?;
+    let old_map_off = le32(&dex_bytes[HDR_MAP_OFF..]) as usize;
+    let old_map_end = old_map_off + 4 + entries.len() * 12;
+    anyhow::ensure!(
+        !entries.iter().any(|entry| entry.typ != MAP_TYPE_MAP_LIST
+            && (old_map_off..old_map_end).contains(&(entry.off as usize))),
+        "map overlaps another section"
+    );
+    if let Some(replacements) = relocated {
+        for replacement in replacements {
+            entries.retain(|entry| entry.typ != replacement.typ);
+            if replacement.size != 0 {
+                entries.push(*replacement);
             }
-        })
-        .collect();
-
-    let map_entry_off = entries
-        .iter()
-        .find(|entry| entry.typ == MAP_TYPE_MAP_LIST)
-        .map(|entry| entry.off);
-    let ordered = entries.windows(2).all(|pair| pair[0].off <= pair[1].off);
-    let map_is_last = map_entry_off
-        .is_some_and(|off| off == map_off as u32 && entries.iter().all(|e| e.off <= off));
-    // Being the highest offset *in the map* is not enough: anything appended
-    // after it — the code_items we just rebuilt, for instance — is invisible to
-    // the map, so check the file itself.
-    if ordered && map_is_last && table_end == dex_bytes.len() {
-        return false;
+        }
     }
-
+    let map_off = le32(&dex_bytes[HDR_MAP_OFF..]);
+    let ordered = entries.windows(2).all(|pair| pair[0].off < pair[1].off);
+    let last = entries.last().is_some_and(|entry| {
+        entry.typ == MAP_TYPE_MAP_LIST && entry.off == map_off && entry.size == 1
+    });
+    if relocated.is_none()
+        && ordered
+        && last
+        && map_off as usize + 4 + entries.len() * 12 == dex_bytes.len()
+    {
+        return Ok(false);
+    }
     align_to(dex_bytes, 4);
-    let Ok(new_map_off) = u32::try_from(dex_bytes.len()) else {
-        return false;
-    };
-    match entries
-        .iter_mut()
-        .find(|entry| entry.typ == MAP_TYPE_MAP_LIST)
-    {
-        Some(entry) => {
-            entry.off = new_map_off;
-            entry.size = 1;
-        }
-        None => entries.push(MapEntry {
-            typ: MAP_TYPE_MAP_LIST,
-            size: 1,
-            off: new_map_off,
-        }),
+    let new_off = u32::try_from(dex_bytes.len())?;
+    entries.retain(|entry| entry.typ != MAP_TYPE_MAP_LIST);
+    entries.push(MapEntry {
+        typ: MAP_TYPE_MAP_LIST,
+        size: 1,
+        off: new_off,
+    });
+    entries.sort_by_key(|entry| entry.off);
+    dex_bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for entry in entries {
+        dex_bytes.extend_from_slice(&entry.typ.to_le_bytes());
+        dex_bytes.extend_from_slice(&0u16.to_le_bytes());
+        dex_bytes.extend_from_slice(&entry.size.to_le_bytes());
+        dex_bytes.extend_from_slice(&entry.off.to_le_bytes());
     }
-    entries.sort_by_key(|entry| (entry.off, entry.typ));
+    dex_bytes[HDR_MAP_OFF..HDR_MAP_OFF + 4].copy_from_slice(&new_off.to_le_bytes());
+    dex_bytes[old_map_off..old_map_end].fill(0);
+    Ok(true)
+}
 
-    let mut table = Vec::with_capacity(4 + entries.len() * 12);
-    table.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for entry in &entries {
-        table.extend_from_slice(&entry.typ.to_le_bytes());
-        table.extend_from_slice(&0u16.to_le_bytes()); // unused
-        table.extend_from_slice(&entry.size.to_le_bytes());
-        table.extend_from_slice(&entry.off.to_le_bytes());
+/// Locate the complete code_item, including padding, tries and handlers.
+fn code_item_end(bytes: &[u8], off: u32) -> Result<usize> {
+    let start = off as usize;
+    anyhow::ensure!(off != 0 && off.is_multiple_of(4), "unaligned code_item");
+    let insns_len = code_item_insns_len(bytes, off).context("code_item out of bounds")?;
+    let insns_units = insns_len / 2;
+    let mut pos = start + CODE_ITEM_HEADER_SIZE + insns_len;
+    let tries = u16::from_le_bytes([bytes[start + 6], bytes[start + 7]]) as usize;
+    if tries == 0 {
+        return Ok(pos);
     }
-    dex_bytes.extend_from_slice(&table);
-    dex_bytes[HDR_MAP_OFF..HDR_MAP_OFF + 4].copy_from_slice(&new_map_off.to_le_bytes());
-
-    // The old table is unreachable now. Zero it so a scanner cannot mistake
-    // stale offsets for live data — but only when it sits before the data
-    // section, so we never blank out real content.
-    if let Some(first_data) = entries
-        .iter()
-        .filter(|entry| entry.typ > MAP_TYPE_MAP_LIST)
-        .map(|entry| entry.off as usize)
-        .min()
-    {
-        if table_end <= first_data.min(dex_bytes.len()) {
-            dex_bytes[map_off..table_end].fill(0);
+    pos = pos.checked_add(3).context("code_item overflow")? & !3;
+    let tries_start = pos;
+    pos = pos.checked_add(tries * 8).context("try table overflow")?;
+    anyhow::ensure!(pos < bytes.len(), "try table out of bounds");
+    let handlers_start = pos;
+    let count = take_uleb(bytes, &mut pos)?;
+    let mut handler_offsets = HashSet::new();
+    for _ in 0..count {
+        handler_offsets.insert(pos - handlers_start);
+        let size = take_sleb(bytes, &mut pos)?;
+        for _ in 0..size.unsigned_abs() {
+            take_uleb(bytes, &mut pos)?; // type_idx is checked separately by ART.
+            let addr = take_uleb(bytes, &mut pos)?;
+            anyhow::ensure!(
+                (addr as usize) < insns_units,
+                "handler address out of bounds"
+            );
+        }
+        if size <= 0 {
+            let addr = take_uleb(bytes, &mut pos)?;
+            anyhow::ensure!(
+                (addr as usize) < insns_units,
+                "catch-all address out of bounds"
+            );
         }
     }
-    true
+    for i in 0..tries {
+        let at = tries_start + i * 8;
+        let begin = le32(&bytes[at..]) as usize;
+        let count = u16::from_le_bytes([bytes[at + 4], bytes[at + 5]]) as usize;
+        let handler = u16::from_le_bytes([bytes[at + 6], bytes[at + 7]]) as usize;
+        anyhow::ensure!(
+            begin + count <= insns_units && handler_offsets.contains(&handler),
+            "invalid try item"
+        );
+    }
+    Ok(pos)
+}
+
+fn take_sleb(bytes: &[u8], pos: &mut usize) -> Result<i32> {
+    let mut value = 0i64;
+    for i in 0..5 {
+        let byte = *bytes.get(*pos).context("truncated SLEB128")?;
+        *pos += 1;
+        value |= i64::from(byte & 0x7f) << (i * 7);
+        if byte & 0x80 == 0 {
+            if byte & 0x40 != 0 {
+                value |= !0i64 << ((i + 1) * 7);
+            }
+            return i32::try_from(value).context("SLEB128 overflow");
+        }
+    }
+    anyhow::bail!("invalid SLEB128")
+}
+
+fn validate_id_bounds(bytes: &[u8]) -> Result<()> {
+    let header = crate::dex::DexHeader::parse(bytes)?;
+    anyhow::ensure!(
+        header.header_size == DEX_HEADER_SIZE as u32,
+        "unsupported DEX header size"
+    );
+    anyhow::ensure!(
+        header.endian_tag == 0x1234_5678,
+        "unsupported DEX endian tag"
+    );
+    let mut spans = Vec::new();
+    for (count, off, width) in [
+        (header.string_ids_size, header.string_ids_off, 4usize),
+        (header.type_ids_size, header.type_ids_off, 4),
+        (header.proto_ids_size, header.proto_ids_off, 12),
+        (header.field_ids_size, header.field_ids_off, 8),
+        (header.method_ids_size, header.method_ids_off, 8),
+        (
+            header.class_defs_size,
+            header.class_defs_off,
+            CLASS_DEF_SIZE,
+        ),
+    ] {
+        if count == 0 {
+            continue;
+        }
+        let end = (off as usize)
+            .checked_add(
+                (count as usize)
+                    .checked_mul(width)
+                    .context("id table overflow")?,
+            )
+            .context("id table overflow")?;
+        anyhow::ensure!(
+            off as usize >= DEX_HEADER_SIZE && off % 4 == 0 && end <= bytes.len(),
+            "id table out of bounds"
+        );
+        spans.push((off as usize, end));
+    }
+    spans.sort_unstable();
+    anyhow::ensure!(
+        spans.windows(2).all(|p| p[0].1 <= p[1].0),
+        "overlapping id tables"
+    );
+    Ok(())
+}
+
+/// These checks cover repaired structures, not full bytecode semantics.
+fn validate_repaired_dex(bytes: &[u8]) -> Result<()> {
+    validate_id_bounds(bytes)?;
+    let parser = DexParser::new(bytes)?;
+    let header = parser.header();
+    anyhow::ensure!(
+        header.file_size as usize == bytes.len(),
+        "file_size mismatch"
+    );
+    anyhow::ensure!(
+        header.data_off as usize >= DEX_HEADER_SIZE
+            && header.data_off as usize + header.data_size as usize == bytes.len(),
+        "data bounds mismatch"
+    );
+    anyhow::ensure!(
+        header.signature.as_slice() == Sha1::digest(&bytes[32..]).as_slice(),
+        "signature mismatch"
+    );
+    let mut adler = Adler32::new();
+    adler.write_slice(&bytes[12..]);
+    anyhow::ensure!(header.checksum == adler.checksum(), "checksum mismatch");
+    let entries = read_map_entries(bytes)?;
+    anyhow::ensure!(
+        entries.windows(2).all(|p| p[0].off < p[1].off),
+        "unordered map"
+    );
+    anyhow::ensure!(
+        entries
+            .iter()
+            .any(|e| e.typ == MAP_TYPE_MAP_LIST && e.off == header.map_off && e.size == 1),
+        "map self-entry mismatch"
+    );
+    let mut classes = HashSet::new();
+    let mut codes = HashSet::new();
+    for i in 0..header.class_defs_size as usize {
+        let at = header.class_defs_off as usize + i * CLASS_DEF_SIZE;
+        let off = le32(&bytes[at + 24..]);
+        if off == 0 {
+            continue;
+        }
+        classes.insert(off);
+        let mut class = parse_class_data(bytes, off)?;
+        for method in class.methods_mut() {
+            anyhow::ensure!(
+                method.method_idx < header.method_ids_size,
+                "method index out of bounds"
+            );
+            if method.code_off != 0 {
+                code_item_end(bytes, method.code_off)?;
+                codes.insert(method.code_off);
+            }
+        }
+    }
+    for (typ, offsets) in [(0x2000, classes), (0x2001, codes)] {
+        if let Some(entry) = entries.iter().find(|entry| entry.typ == typ) {
+            anyhow::ensure!(
+                entry.size as usize == offsets.len() && offsets.iter().min() == Some(&entry.off),
+                "live item/map mismatch for 0x{typ:x}"
+            );
+            let mut ordered: Vec<_> = offsets.into_iter().collect();
+            ordered.sort_unstable();
+            let mut pos = entry.off as usize;
+            for off in ordered {
+                if typ == 0x2001 {
+                    pos = (pos + 3) & !3;
+                }
+                anyhow::ensure!(off as usize == pos, "noncontiguous map run for 0x{typ:x}");
+                pos = if typ == 0x2001 {
+                    code_item_end(bytes, off)?
+                } else {
+                    parse_class_data_end(bytes, off)?.1
+                };
+            }
+            let next = entries
+                .iter()
+                .filter(|other| other.off > entry.off)
+                .map(|other| other.off as usize)
+                .min()
+                .unwrap_or(bytes.len());
+            anyhow::ensure!(pos <= next, "overlapping map run for 0x{typ:x}");
+        } else {
+            anyhow::ensure!(offsets.is_empty(), "missing live item map for 0x{typ:x}");
+        }
+    }
+    Ok(())
 }
 
 /// Bring `file_size`, `data_off` and `data_size` back in line with the real
@@ -1309,9 +1493,26 @@ fn fix_header_bounds(dex_bytes: &mut [u8]) -> bool {
     let Ok(header) = crate::dex::DexHeader::parse(dex_bytes) else {
         return false;
     };
-    let class_defs_end = (header.class_defs_off as usize)
-        .saturating_add((header.class_defs_size as usize).saturating_mul(CLASS_DEF_SIZE));
-    let Some(data_off) = class_defs_end.checked_add(3).map(|end| end & !3) else {
+    let tables_end = [
+        (header.string_ids_off, header.string_ids_size, 4usize),
+        (header.type_ids_off, header.type_ids_size, 4),
+        (header.proto_ids_off, header.proto_ids_size, 12),
+        (header.field_ids_off, header.field_ids_size, 8),
+        (header.method_ids_off, header.method_ids_size, 8),
+        (
+            header.class_defs_off,
+            header.class_defs_size,
+            CLASS_DEF_SIZE,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, count, _)| *count != 0)
+    .map(|(off, count, width)| {
+        (off as usize).saturating_add((count as usize).saturating_mul(width))
+    })
+    .max()
+    .unwrap_or(DEX_HEADER_SIZE);
+    let Some(data_off) = tables_end.checked_add(3).map(|end| end & !3) else {
         return false;
     };
     // A class_defs table claiming to end past EOF tells us nothing usable.
@@ -1751,7 +1952,11 @@ mod tests {
 
         align_to(&mut dex, 4);
         let map_off = dex.len();
+        dex.extend_from_slice(&2u32.to_le_bytes());
+        dex.extend_from_slice(&0x2000u16.to_le_bytes());
+        dex.extend_from_slice(&0u16.to_le_bytes());
         dex.extend_from_slice(&1u32.to_le_bytes());
+        dex.extend_from_slice(&(class_data_off as u32).to_le_bytes());
         dex.extend_from_slice(&MAP_TYPE_MAP_LIST.to_le_bytes());
         dex.extend_from_slice(&0u16.to_le_bytes());
         dex.extend_from_slice(&1u32.to_le_bytes());
@@ -1775,6 +1980,7 @@ mod tests {
         let file_size = dex.len() as u32;
         put_u32(&mut dex, HDR_FILE_SIZE, file_size);
         put_u32(&mut dex, 0x24, DEX_HEADER_SIZE as u32);
+        put_u32(&mut dex, 0x28, 0x1234_5678);
         put_u32(&mut dex, HDR_MAP_OFF, map_off as u32);
         put_u32(&mut dex, 0x38, STRINGS.len() as u32);
         put_u32(&mut dex, 0x3c, string_ids_off as u32);
@@ -1808,6 +2014,22 @@ mod tests {
         let new_off = dex.len() as u32;
         dex.extend_from_slice(&encoded);
         put_u32(&mut dex, 0xa0 + 24, new_off);
+        rebuild_map(
+            &mut dex,
+            Some(&[
+                MapEntry {
+                    typ: 0x2001,
+                    size: 1,
+                    off: code_off,
+                },
+                MapEntry {
+                    typ: 0x2000,
+                    size: 1,
+                    off: new_off,
+                },
+            ]),
+        )
+        .unwrap();
         (dex, code_off)
     }
 
@@ -1958,6 +2180,15 @@ mod tests {
         dex.extend_from_slice(&encoded);
         put_u32(&mut dex, 0xa0 + 24, new_off);
 
+        rebuild_map(
+            &mut dex,
+            Some(&[MapEntry {
+                typ: 0x2000,
+                size: 1,
+                off: new_off,
+            }]),
+        )
+        .unwrap();
         let stats =
             repair_one_dex(&mut dex, Some(&record(V9_BODY)), FixOptions::default()).unwrap();
         assert_eq!(stats.appended, 0);
@@ -2003,23 +2234,21 @@ mod tests {
     }
 
     #[test]
-    fn repair_survives_a_map_off_the_packer_zeroed() {
+    fn repair_rejects_an_unreadable_map_before_mutation() {
         let mut dex = dex_with_method(0);
         put_u32(&mut dex, HDR_MAP_OFF, 0);
-        let stats =
-            repair_one_dex(&mut dex, Some(&record(V9_BODY)), FixOptions::default()).unwrap();
-        assert!(!stats.map_rebuilt, "an unreadable map is left alone");
-        assert_eq!(stats.appended, 1, "the rest of the repair still runs");
+        let original = dex.clone();
+        assert!(repair_one_dex(&mut dex, Some(&record(V9_BODY)), FixOptions::default()).is_err());
+        assert_eq!(dex, original);
     }
 
     #[test]
-    fn repair_survives_class_defs_pointing_past_the_end() {
+    fn repair_rejects_class_defs_pointing_past_the_end() {
         let mut dex = dex_with_method(0);
         put_u32(&mut dex, 0x64, 0x10_0000);
-        let stats =
-            repair_one_dex(&mut dex, Some(&record(V9_BODY)), FixOptions::default()).unwrap();
-        assert!(!stats.header_fixed);
-        assert_eq!(stats.appended, 0);
+        let original = dex.clone();
+        assert!(repair_one_dex(&mut dex, Some(&record(V9_BODY)), FixOptions::default()).is_err());
+        assert_eq!(dex, original);
     }
 
     #[test]
@@ -2036,5 +2265,246 @@ mod tests {
 
         let out = fs::read(dir.path().join("repair").join("dex_1000_b0.dex")).unwrap();
         assert_recovered_body(&out);
+    }
+
+    #[test]
+    fn accepts_process_and_quarantine_names_alongside_legacy_names() {
+        for base in ["dex_1000_70", "dex_65_1000_70", "dex_65_1000_aabbcc_70"] {
+            assert_eq!(dex_file_base(&format!("{base}.dex")).as_deref(), Some(base));
+            assert_eq!(
+                dex_code_json_base(&format!("{base}_code.json")).as_deref(),
+                Some(base)
+            );
+        }
+        assert!(dex_file_base("dex_65__70.dex").is_none());
+    }
+
+    #[test]
+    fn dedup_preserves_equal_size_distinct_dexes_and_distinct_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let inputs: Vec<_> = (1..=4)
+            .map(|i| {
+                let base = format!("dex_{i}_70");
+                let path = dir.path().join(format!("{base}.dex"));
+                fs::write(
+                    &path,
+                    if i == 2 {
+                        b"different".as_slice()
+                    } else {
+                        b"identical".as_slice()
+                    },
+                )
+                .unwrap();
+                (base, path)
+            })
+            .collect();
+        fs::write(dir.path().join("dex_3_70_code.json"), "[]").unwrap();
+        let kept = dedup_dex_files(&inputs, dir.path());
+        assert_eq!(kept.len(), 3);
+        assert!(inputs.iter().all(|(_, path)| path.is_file()));
+    }
+
+    #[test]
+    fn repair_returns_error_but_keeps_successful_outputs_and_originals() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dex_with_method(0);
+        fs::write(dir.path().join("dex_1_70.dex"), &good).unwrap();
+        fs::write(dir.path().join("dex_2_70.dex"), b"invalid").unwrap();
+        let result = repair_directory(dir.path(), None, FixOptions::default());
+        assert!(result.is_err());
+        assert!(dir.path().join("repair/dex_1_70.dex").is_file());
+        assert!(!dir.path().join("repair/dex_2_70.dex").exists());
+        assert_eq!(fs::read(dir.path().join("dex_1_70.dex")).unwrap(), good);
+    }
+
+    #[test]
+    fn malformed_records_do_not_replace_previous_output() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("dex_1_70.dex"), dex_with_method(0)).unwrap();
+        fs::write(dir.path().join("dex_1_70_code.json"), "not json").unwrap();
+        fs::create_dir(dir.path().join("repair")).unwrap();
+        let output = dir.path().join("repair/dex_1_70.dex");
+        fs::write(&output, b"previous").unwrap();
+        assert!(repair_directory(dir.path(), None, FixOptions::default()).is_err());
+        assert_eq!(fs::read(output).unwrap(), b"previous");
+    }
+
+    #[test]
+    fn output_write_failure_is_not_reported_as_success() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("dex_1_70.dex"), dex_with_method(0)).unwrap();
+        fs::create_dir_all(dir.path().join("repair/dex_1_70.dex")).unwrap();
+        assert!(repair_directory(dir.path(), None, FixOptions::default()).is_err());
+        assert_eq!(fs::read_dir(dir.path().join("repair")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn structural_validation_rejects_bad_checksums_and_map_counts() {
+        let mut dex = dex_with_method(0);
+        repair_one_dex(&mut dex, Some(&record(V9_BODY)), FixOptions::default()).unwrap();
+        validate_repaired_dex(&dex).unwrap();
+        let mut bad = dex.clone();
+        bad[8] ^= 1;
+        assert!(validate_repaired_dex(&bad)
+            .unwrap_err()
+            .to_string()
+            .contains("checksum"));
+        let mut bad = dex.clone();
+        bad[12] ^= 1;
+        assert!(validate_repaired_dex(&bad)
+            .unwrap_err()
+            .to_string()
+            .contains("signature"));
+        let map = le32(&dex[HDR_MAP_OFF..]) as usize;
+        let entries = read_map_entries(&dex).unwrap();
+        let index = entries.iter().position(|e| e.typ == 0x2001).unwrap();
+        put_u32(&mut dex, map + 4 + index * 12 + 4, 99);
+        recalc_dex_header(&mut dex);
+        assert!(validate_repaired_dex(&dex)
+            .unwrap_err()
+            .to_string()
+            .contains("map mismatch"));
+    }
+
+    #[test]
+    fn fix_fallback_keeps_original_but_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = minimal_dex_with_code_item();
+        fs::write(dir.path().join("dex_1_70.dex"), &original).unwrap();
+        fs::write(dir.path().join("dex_1_70_code.json"), "invalid").unwrap();
+        assert!(fix_dex_directory(dir.path()).is_err());
+        assert_eq!(
+            fs::read(dir.path().join("final/dex_1_70.dex")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn full_code_item_length_preserves_handlers_and_rejects_truncation() {
+        let mut bytes = vec![0; 4];
+        let start = bytes.len() as u32;
+        bytes.extend_from_slice(&[1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0]);
+        bytes.extend_from_slice(&[0x12, 0, 0x0e, 0]);
+        bytes.extend_from_slice(&[0, 0, 0, 0, 2, 0, 1, 0]);
+        // One handler, catch-all only, at code-unit address one.
+        bytes.extend_from_slice(&[1, 0, 1]);
+        assert_eq!(code_item_end(&bytes, start).unwrap(), bytes.len());
+        bytes.pop();
+        assert!(code_item_end(&bytes, start).is_err());
+    }
+
+    #[test]
+    fn relocation_groups_all_classes_and_preserves_intact_try_handlers() {
+        // Two classes and methods, sharing a void/no-argument prototype.
+        let mut dex = vec![0; 0xec];
+        dex[..8].copy_from_slice(b"dex\n035\0");
+        put_u32(&mut dex, 0x24, 0x70);
+        put_u32(&mut dex, 0x28, 0x1234_5678);
+        for (size_at, count, off) in [
+            (0x38, 5, 0x70),
+            (0x40, 3, 0x84),
+            (0x48, 1, 0x90),
+            (0x58, 2, 0x9c),
+            (0x60, 2, 0xac),
+        ] {
+            put_u32(&mut dex, size_at, count);
+            put_u32(&mut dex, size_at + 4, off);
+        }
+        for (i, text) in ["V", "Lx;", "Ly;", "a", "b"].iter().enumerate() {
+            let off = dex.len() as u32;
+            put_u32(&mut dex, 0x70 + i * 4, off);
+            dex.push(text.len() as u8);
+            dex.extend_from_slice(text.as_bytes());
+            dex.push(0);
+        }
+        for i in 0..3 {
+            put_u32(&mut dex, 0x84 + i * 4, i as u32);
+        }
+        for i in 0..2 {
+            dex[0x9c + i * 8..0x9e + i * 8].copy_from_slice(&(i as u16 + 1).to_le_bytes());
+            put_u32(&mut dex, 0xa0 + i * 8, i as u32 + 3);
+            put_u32(&mut dex, 0xac + i * 32, i as u32 + 1);
+        }
+        align_to(&mut dex, 4);
+        let intact_off = dex.len() as u32;
+        let intact = [
+            1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0x12, 0, 0x0e, 0, 0, 0, 0, 0, 2, 0, 1,
+            0, 1, 0, 1,
+        ];
+        dex.extend_from_slice(&intact);
+        let debug_off = dex.len() as u32;
+        let debug_data = [1, 0, 0];
+        dex.extend_from_slice(&debug_data);
+        let class_start = dex.len() as u32;
+        for i in 0..2 {
+            let off = dex.len() as u32;
+            put_u32(&mut dex, 0xac + i * 32 + 24, off);
+            dex.extend_from_slice(&[0, 0, 1, 0, i as u8, 9]);
+            push_uleb(&mut dex, if i == 0 { 0 } else { intact_off });
+        }
+        align_to(&mut dex, 4);
+        let map_off = dex.len() as u32;
+        put_u32(&mut dex, HDR_MAP_OFF, map_off);
+        dex.extend_from_slice(&4u32.to_le_bytes());
+        for entry in [
+            MapEntry {
+                typ: 0x2001,
+                size: 1,
+                off: intact_off,
+            },
+            MapEntry {
+                typ: 0x2003,
+                size: 1,
+                off: debug_off,
+            },
+            MapEntry {
+                typ: 0x2000,
+                size: 2,
+                off: class_start,
+            },
+            MapEntry {
+                typ: MAP_TYPE_MAP_LIST,
+                size: 1,
+                off: map_off,
+            },
+        ] {
+            dex.extend_from_slice(&entry.typ.to_le_bytes());
+            dex.extend_from_slice(&0u16.to_le_bytes());
+            dex.extend_from_slice(&entry.size.to_le_bytes());
+            dex.extend_from_slice(&entry.off.to_le_bytes());
+        }
+        let original_len = dex.len();
+        let stats = repair_one_dex(&mut dex, Some(&record("0e00")), FixOptions::default()).unwrap();
+        assert!(dex[intact_off as usize..debug_off as usize]
+            .iter()
+            .all(|&byte| byte == 0));
+        assert_eq!(&dex[debug_off as usize..class_start as usize], &debug_data);
+        assert!(dex[class_start as usize..original_len]
+            .iter()
+            .all(|&byte| byte == 0));
+        assert_eq!(stats.appended, 1);
+        let entries = read_map_entries(&dex).unwrap();
+        assert_eq!(entries.iter().find(|e| e.typ == 0x2001).unwrap().size, 2);
+        assert_eq!(entries.iter().find(|e| e.typ == 0x2000).unwrap().size, 2);
+        let class_off = le32(&dex[0xcc + 24..]);
+        let class = parse_class_data(&dex, class_off).unwrap();
+        let off = class.direct_methods[0].code_off;
+        assert_ne!(off, intact_off);
+        assert_eq!(
+            &dex[off as usize..code_item_end(&dex, off).unwrap()],
+            &intact
+        );
+        validate_repaired_dex(&dex).unwrap();
+    }
+
+    #[test]
+    fn moving_map_zeros_the_retired_table() {
+        let mut dex = dex_with_method(0);
+        let old_off = le32(&dex[HDR_MAP_OFF..]) as usize;
+        let old_end = dex.len();
+        dex.extend_from_slice(&[0; 4]);
+        assert!(rebuild_map(&mut dex, None).unwrap());
+        assert!(dex[old_off..old_end].iter().all(|&byte| byte == 0));
+        assert!(read_map_entries(&dex).is_ok());
     }
 }

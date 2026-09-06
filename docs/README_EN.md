@@ -19,7 +19,16 @@ adb push target/aarch64-linux-android/release/eBPFDexDumper /data/local/tmp/
 adb shell su -c '/data/local/tmp/eBPFDexDumper dump -n com.example.app -o /data/local/tmp/dex_out'
 ```
 
-Default `full` mode auto-repairs and validates DEX on exit. Output goes to `final/`.
+The default `full` mode auto-repairs DEX on exit into `repair/`. The standalone `fix` command still writes its combined output into `final/`.
+
+## Notes
+
+- Captures are isolated by process and named `dex_<pid>_<begin>_<size>.dex` (hexadecimal). Older filenames remain supported. Use a fresh output directory per session.
+- `repair` preserves inputs, checks structure and checksums, and returns nonzero on failure. These checks are not full ART bytecode verification.
+- Normal shutdown drains event queues, including JNI. A second stop signal interrupts draining.
+- JNI discovery can select an incorrect offset on API 35. Use `--register-natives-offset` with an offset verified for the current `libart.so`.
+
+[Validation and limitations](DEFENSIVE_VALIDATION.md) · [Build and contribution guide](../CONTRIBUTING.md) (Chinese)
 
 ## Subcommands
 
